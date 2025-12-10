@@ -160,7 +160,7 @@ struct Player
 		}
 		else
 		{
-			// "あ" 以外なら元の色に戻すなどの処理が必要であればここに記述.
+			// "あ" 以外なら元の色に戻す.
 			color = Palette::Skyblue;
 
 			if (command == U"い")
@@ -201,6 +201,11 @@ void Main()
 	size_t currentLearningIndex = 0; // 現在学習中の母音インデックス.
 	bool isGameMode = false; // ゲームモードかどうか.
 
+	// チャタリング対策用変数.
+	String potentialVowel = U""; // 現在候補となっている母音.
+	int32 stabilityCount = 0; // 同じ判定が続いたフレーム数.
+	const int32 STABILITY_THRESHOLD = 5; // 確定に必要な連続フレーム数.
+
 	Player player{Scene::Center(), Palette::Skyblue};
 	Font font{40};
 
@@ -231,7 +236,7 @@ void Main()
 				font(U"学習モード: 「{}」と言いながら\nSPACEキーを押し続けてください"_fmt(target))
 					.drawAt(Scene::Center(), Palette::White);
 
-				// スペースキーを押している間、学習データを記録し続ける (平均化はせず、最新の有効なフレームを採用する簡易実装).
+				// スペースキーを押している間、学習データを記録し続ける.
 				if (KeySpace.pressed() && currentRMS > rmsThreshold && !mfcc.isUnset())
 				{
 					learnedMFCCs[currentLearningIndex] = mfcc;
@@ -266,10 +271,11 @@ void Main()
 			Scene::SetBackground(Palette::White);
 			font(U"声で操作してください").drawAt(400, 50, Palette::Black);
 
-			// 現在の音声が閾値を超えている場合のみ判定.
-			String detectedVowel = U"";
+			String confirmedVowel = U""; // 最終的に確定したコマンド.
+			String currentBestVowel = U""; // 今のフレームで一番近い母音.
 			double maxSimilarity = 0.0;
 
+			// 音量が閾値を超えている場合のみ判定を行う.
 			if (currentRMS > rmsThreshold && !mfcc.isUnset())
 			{
 				int bestIndex = -1;
@@ -285,21 +291,47 @@ void Main()
 					}
 				}
 
-				// 類似度が一定以上ならコマンドとして採用.
+				// 類似度が一定以上なら候補とする.
 				if (bestIndex != -1 && maxSimilarity > 0.85) // 0.85は判定の厳しさ.
 				{
-					detectedVowel = vowels[bestIndex];
+					currentBestVowel = vowels[bestIndex];
 				}
 			}
 
+			// --- チャタリング対策 (安定化処理) ---
+			// 1. 今回の候補が前回と同じ場合、カウントを増やす.
+			if (currentBestVowel != U"" && currentBestVowel == potentialVowel)
+			{
+				stabilityCount++;
+			}
+			else
+			{
+				// 違う母音、または無音になったらカウントをリセットして候補を更新.
+				potentialVowel = currentBestVowel;
+				stabilityCount = 0;
+			}
+
+			// 2. 一定フレーム連続で同じ判定が出たら、コマンドとして確定させる.
+			if (stabilityCount > STABILITY_THRESHOLD)
+			{
+				confirmedVowel = potentialVowel;
+			}
+			// ------------------------------------
+
 			// プレイヤーの更新と描画.
-			player.update(detectedVowel, Scene::DeltaTime());
+			player.update(confirmedVowel, Scene::DeltaTime());
 			player.draw();
 
-			// デバッグ表示: 現在の認識結果.
-			if (detectedVowel)
+			// デバッグ表示.
+			if (confirmedVowel)
 			{
-				font(detectedVowel).drawAt(Scene::Center().movedBy(0, -100), Palette::Black);
+				// 確定したコマンドを表示.
+				font(confirmedVowel).drawAt(Scene::Center().movedBy(0, -100), Palette::Black);
+			}
+			else if (potentialVowel)
+			{
+				// 判定中 (未確定) の場合は薄く表示.
+				font(potentialVowel).drawAt(Scene::Center().movedBy(0, -100), ColorF{0.8});
 			}
 
 			// 操作ガイド.
