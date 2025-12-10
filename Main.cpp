@@ -1,6 +1,6 @@
 ﻿#include <Siv3D.hpp> // Siv3D v0.6.16
 
-// --- MFCC 関連クラス群 ---
+// --- MFCC 関連クラス群 (変更なし) ---
 
 struct MFCC
 {
@@ -68,24 +68,17 @@ public:
 		const auto& buffer = mic.getBuffer();
 		const size_t writePos = mic.posSample();
 
-		// バッファのコピー.
 		for (size_t pos : step(f.size()))
 		{
 			const size_t idx = (pos + writePos < f.size() ? mic.getBufferLength() : 0) + pos + writePos - f.size();
 			f[pos] = buffer[idx].left;
 		}
 
-		// プリエンファシス (double -> float 警告回避のため明示的キャストとリテラルを使用).
 		for (size_t i : Range(f.size() - 1, 1, -1))
-		{
 			f[i] -= f[i - 1] * 0.96875f;
-		}
 
-		// ハミング窓.
 		for (size_t i : Range(f.size() - 2, 1))
-		{
 			f[i] *= static_cast<float>(0.54 - 0.46 * cos(2.0 * Math::Pi * i / (f.size() - 1)));
-		}
 		f.front() = 0.0f;
 		f.back() = 0.0f;
 
@@ -95,7 +88,6 @@ public:
 		const auto melMin = freqToMel(0);
 		const auto deltaMel = (melMax - melMin) / static_cast<double>(melChannels + 1);
 
-		// bin 計算 (double -> size_t への変換警告を回避).
 		for (size_t i : step(bin.size()))
 		{
 			bin[i] = static_cast<size_t>((f.size() + 1) * melToFreq(melMin + i * deltaMel) / sampleRate);
@@ -137,9 +129,8 @@ protected:
 	size_t mfccOrder;
 };
 
-// --- ゲーム用ロジック ---
+// --- ゲーム関連構造体 ---
 
-// 音量計算用ユーティリティ.
 [[nodiscard]] double volumeToRMS(const double volume)
 {
 	return Clamp(Math::Pow(10.0, (volume - 1.0) * 5.0), 0.0, 1.0);
@@ -153,16 +144,11 @@ struct Player
 
 	void update(const String& command, double deltaTime)
 	{
-		// コマンドに応じて状態を変更.
 		if (command == U"あ")
-		{
 			color = Palette::Red;
-		}
 		else
 		{
-			// "あ" 以外なら元の色に戻す.
 			color = Palette::Skyblue;
-
 			if (command == U"い")
 				pos.x -= speed * deltaTime;
 			else if (command == U"う")
@@ -172,8 +158,6 @@ struct Player
 			else if (command == U"お")
 				pos.y += speed * deltaTime;
 		}
-
-		// 画面外に出ないように制限.
 		pos = pos.clamp(Scene::Rect().stretched(-20));
 	}
 
@@ -181,6 +165,14 @@ struct Player
 	{
 		Circle{pos, 30}.draw(color);
 	}
+};
+
+// 学習データのスロット管理用.
+struct LearningSlot
+{
+	String label;
+	MFCC mfcc;
+	bool isRecorded = false;
 };
 
 void Main()
@@ -191,27 +183,34 @@ void Main()
 	MFCCAnalyzer mfccAnalyzer{};
 	Microphone mic{StartImmediately::Yes};
 
-	// 音量閾値 (これより小さい音は無視する).
 	const double rmsThreshold = volumeToRMS(0.5);
 
-	// 母音のラベルと学習データ.
-	const Array<String> vowels = {U"あ", U"い", U"う", U"え", U"お"};
-	Array<MFCC> learnedMFCCs(5);
+	// 学習データの初期化.
+	Array<LearningSlot> slots = {
+		{U"あ", {}, false},
+		{U"い", {}, false},
+		{U"う", {}, false},
+		{U"え", {}, false},
+		{U"お", {}, false}};
 
-	size_t currentLearningIndex = 0; // 現在学習中の母音インデックス.
-	bool isGameMode = false; // ゲームモードかどうか.
+	int32 selectedSlotIndex = 0; // 現在選択中のスロット.
+	bool isGameMode = false;
 
 	// チャタリング対策用変数.
-	String potentialVowel = U""; // 現在候補となっている母音.
-	int32 stabilityCount = 0; // 同じ判定が続いたフレーム数.
-	const int32 STABILITY_THRESHOLD = 5; // 確定に必要な連続フレーム数.
+	String potentialVowel = U"";
+	int32 stabilityCount = 0;
+	const int32 STABILITY_THRESHOLD = 5;
+
+	// 平均化学習用変数.
+	Array<double> currentFeatureSum;
+	int32 currentSampleCount = 0;
 
 	Player player{Scene::Center(), Palette::Skyblue};
 	Font font{40};
+	Font smallFont{20};
 
 	while (System::Update())
 	{
-		// マイクの初期化チェック.
 		if (System::EnumerateMicrophones().none([&](const auto& info)
 		{
 			return info.microphoneIndex == mic.microphoneIndex();
@@ -220,49 +219,132 @@ void Main()
 			mic.open(StartImmediately::Yes);
 		}
 
-		// 現在の音声解析.
 		const auto mfcc = mfccAnalyzer.analyze(mic);
 		const double currentRMS = mic.rootMeanSquare();
 
-		// モード分岐.
 		if (not isGameMode)
 		{
-			// --- 学習フェーズ ---
+			// --- 学習フェーズ (UI刷新) ---
 			Scene::SetBackground(Palette::Darkgray);
 
-			if (currentLearningIndex < vowels.size())
+			font(U"学習モード: 選択してSPACEキーを長押し").drawAt(400, 50, Palette::White);
+
+			// キー操作でのスロット移動.
+			if (KeyRight.down())
+				selectedSlotIndex = (selectedSlotIndex + 1) % slots.size();
+			if (KeyLeft.down())
+				selectedSlotIndex = (selectedSlotIndex + (int32) slots.size() - 1) % slots.size();
+
+			// スロットの描画とロジック.
+			const int32 boxSize = 100;
+			const int32 gap = 20;
+			const int32 startX = (Scene::Width() - (boxSize * 5 + gap * 4)) / 2;
+			const int32 startY = 200;
+
+			for (int32 i : step(slots.size()))
 			{
-				const String target = vowels[currentLearningIndex];
-				font(U"学習モード: 「{}」と言いながら\nSPACEキーを押し続けてください"_fmt(target))
-					.drawAt(Scene::Center(), Palette::White);
+				const Rect box{startX + i * (boxSize + gap), startY, boxSize, boxSize};
+				const bool isSelected = (i == selectedSlotIndex);
+				const bool isRecordingNow = isSelected && KeySpace.pressed() && currentRMS > rmsThreshold;
 
-				// スペースキーを押している間、学習データを記録し続ける.
-				if (KeySpace.pressed() && currentRMS > rmsThreshold && !mfcc.isUnset())
+				// マウス選択処理.
+				if (box.leftClicked())
 				{
-					learnedMFCCs[currentLearningIndex] = mfcc;
-
-					// 入力が十分にあれば進捗バーを表示.
-					Rect{0, 500, Scene::Width(), 20}.draw(Palette::Gray);
-					Rect{0, 500, static_cast<int>(Scene::Width() * (mic.rootMeanSquare() / 0.5)), 20}.draw(Palette::Orange);
+					selectedSlotIndex = i;
 				}
 
-				// キーを離した瞬間に次の母音へ.
-				if (KeySpace.up())
+				// 背景描画.
+				box.rounded(10).draw(isSelected ? ColorF{0.3, 0.3, 0.4} : ColorF{0.2});
+				if (isSelected)
 				{
-					if (!learnedMFCCs[currentLearningIndex].isUnset())
+					box.rounded(10).drawFrame(4, Palette::Skyblue);
+				}
+
+				// 文字描画.
+				font(slots[i].label).drawAt(box.center(), Palette::White);
+
+				// 状態表示 (完了マーク).
+				if (slots[i].isRecorded)
+				{
+					smallFont(U"OK").drawAt(box.bottomCenter().movedBy(0, -20), Palette::Lightgreen);
+				}
+
+				// 録音中の演出 (進捗円).
+				if (isRecordingNow)
+				{
+					const double progress = Min(currentSampleCount / 60.0, 1.0);
+					Circle{box.center(), 40}.drawArc(0_deg, 360_deg * progress, 4, 0, Palette::Orange);
+				}
+			}
+
+			// --- 学習ロジック (選択中のスロットに対して実行) ---
+			if (KeySpace.down())
+			{
+				currentFeatureSum.clear();
+				currentSampleCount = 0;
+			}
+
+			if (KeySpace.pressed() && currentRMS > rmsThreshold && !mfcc.isUnset())
+			{
+				if (currentFeatureSum.isEmpty())
+					currentFeatureSum.resize(mfcc.feature.size(), 0.0);
+
+				for (size_t k : step(currentFeatureSum.size()))
+				{
+					currentFeatureSum[k] += mfcc.feature[k];
+				}
+				currentSampleCount++;
+			}
+
+			if (KeySpace.up())
+			{
+				if (currentSampleCount > 10) // ある程度サンプルがないと無効とする.
+				{
+					MFCC averagedMFCC;
+					averagedMFCC.feature = currentFeatureSum.map([&](double x)
 					{
-						currentLearningIndex++;
+						return x / currentSampleCount;
+					});
+
+					// 選択中のスロットに保存.
+					slots[selectedSlotIndex].mfcc = averagedMFCC;
+					slots[selectedSlotIndex].isRecorded = true;
+
+					// 自動で次の未録音スロットへ移動 (便利機能).
+					for (int32 k = 1; k < (int32) slots.size(); ++k)
+					{
+						int32 nextIdx = (selectedSlotIndex + k) % slots.size();
+						if (!slots[nextIdx].isRecorded)
+						{
+							selectedSlotIndex = nextIdx;
+							break;
+						}
 					}
+				}
+				currentFeatureSum.clear();
+				currentSampleCount = 0;
+			}
+
+			// 全て完了しているかチェック.
+			const bool allRecorded = std::all_of(slots.begin(), slots.end(), [](const auto& s)
+			{
+				return s.isRecorded;
+			});
+
+			if (allRecorded)
+			{
+				const Rect startBtn = Rect{Arg::center(400, 450), 300, 60};
+				startBtn.rounded(10).draw(startBtn.mouseOver() ? Palette::Orange : Palette::Darkorange);
+				font(U"ゲーム開始").drawAt(startBtn.center(), Palette::White);
+
+				if (startBtn.leftClicked() || KeyEnter.down())
+				{
+					isGameMode = true;
 				}
 			}
 			else
 			{
-				// 学習完了.
-				font(U"学習完了！\nENTERキーでゲーム開始").drawAt(Scene::Center(), Palette::Yellow);
-				if (KeyEnter.down())
-				{
-					isGameMode = true;
-				}
+				smallFont(U"すべての音声を登録してください").drawAt(400, 450, Palette::Gray);
 			}
 		}
 		else
@@ -271,19 +353,17 @@ void Main()
 			Scene::SetBackground(Palette::White);
 			font(U"声で操作してください").drawAt(400, 50, Palette::Black);
 
-			String confirmedVowel = U""; // 最終的に確定したコマンド.
-			String currentBestVowel = U""; // 今のフレームで一番近い母音.
+			String confirmedVowel = U"";
+			String currentBestVowel = U"";
 			double maxSimilarity = 0.0;
 
-			// 音量が閾値を超えている場合のみ判定を行う.
 			if (currentRMS > rmsThreshold && !mfcc.isUnset())
 			{
 				int bestIndex = -1;
 
-				// 学習データと比較して最も似ている母音を探す.
-				for (size_t i : step(vowels.size()))
+				for (size_t i : step(slots.size()))
 				{
-					double similarity = mfcc.cosineSimilarity(learnedMFCCs[i]);
+					double similarity = mfcc.cosineSimilarity(slots[i].mfcc);
 					if (similarity > maxSimilarity)
 					{
 						maxSimilarity = similarity;
@@ -291,51 +371,48 @@ void Main()
 					}
 				}
 
-				// 類似度が一定以上なら候補とする.
-				if (bestIndex != -1 && maxSimilarity > 0.85) // 0.85は判定の厳しさ.
+				if (bestIndex != -1 && maxSimilarity > 0.85)
 				{
-					currentBestVowel = vowels[bestIndex];
+					currentBestVowel = slots[bestIndex].label;
 				}
 			}
 
-			// --- チャタリング対策 (安定化処理) ---
-			// 1. 今回の候補が前回と同じ場合、カウントを増やす.
+			// チャタリング対策.
 			if (currentBestVowel != U"" && currentBestVowel == potentialVowel)
 			{
 				stabilityCount++;
 			}
 			else
 			{
-				// 違う母音、または無音になったらカウントをリセットして候補を更新.
 				potentialVowel = currentBestVowel;
 				stabilityCount = 0;
 			}
 
-			// 2. 一定フレーム連続で同じ判定が出たら、コマンドとして確定させる.
 			if (stabilityCount > STABILITY_THRESHOLD)
 			{
 				confirmedVowel = potentialVowel;
 			}
-			// ------------------------------------
 
-			// プレイヤーの更新と描画.
 			player.update(confirmedVowel, Scene::DeltaTime());
 			player.draw();
 
-			// デバッグ表示.
 			if (confirmedVowel)
 			{
-				// 確定したコマンドを表示.
 				font(confirmedVowel).drawAt(Scene::Center().movedBy(0, -100), Palette::Black);
 			}
 			else if (potentialVowel)
 			{
-				// 判定中 (未確定) の場合は薄く表示.
 				font(potentialVowel).drawAt(Scene::Center().movedBy(0, -100), ColorF{0.8});
 			}
 
-			// 操作ガイド.
+			// ガイド表示.
 			font(U"あ:赤  い:←  う:↑  え:→  お:↓").drawAt(400, 550, Palette::Gray);
+
+			// 再学習に戻るボタン.
+			if (SimpleGUI::Button(U"再学習", Vec2{20, 20}))
+			{
+				isGameMode = false;
+			}
 		}
 	}
 }
