@@ -1,0 +1,67 @@
+---
+Checks: >
+  clang-analyzer-*,
+  clang-diagnostic-*,
+  bugprone-*,
+  cert-*,
+  cppcoreguidelines-*,
+  modernize-*,
+  performance-*,
+  portability-*,
+  readability-*,
+  misc-use-alternative-operator,
+  llvm-header-guard
+
+WarningsAsErrors: ''
+HeaderFilterRegex: 'src/.*'
+
+CheckOptions:
+  - key: readability-identifier-naming.ClassCase
+    value: CamelCase
+  - key: readability-identifier-naming.StructCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumCase
+    value: CamelCase
+  - key: readability-identifier-naming.EnumConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.FunctionCase
+    value: CamelCase
+  - key: readability-identifier-naming.GlobalConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.ConstexprVariableCase
+    value: CamelCase
+  - key: readability-identifier-naming.GlobalVariableCase
+    value: camelBack
+  - key: readability-identifier-naming.LocalVariableCase
+    value: camelBack
+  - key: readability-identifier-naming.ParameterCase
+    value: camelBack
+  - key: readability-identifier-naming.MemberFunctionCase
+    value: camelBack
+  - key: readability-identifier-naming.PrivateMemberPrefix
+    value: 'm_'
+  - key: readability-identifier-naming.PrivateMemberCase
+    value: camelBack
+  - key: readability-identifier-naming.PublicMemberCase
+    value: camelBack
+  - key: readability-identifier-naming.StaticFunctionCase
+    value: CamelCase
+  - key: readability-identifier-naming.StaticConstantCase
+    value: CamelCase
+  - key: readability-identifier-naming.IgnoredRegexp
+    value: 'Main'
+  - key: misc-use-alternative-operator.Not
+    value: 1
+  - key: modernize-use-scoped-enums.ReplacementEnum
+    value: 'enum class'
+  - key: performance-increment-clone.WarnOnPostIncrement
+    value: 1
+  - key: readability-floating-point-format.RequireAlwaysDecimalPoint
+    value: 1
+  - key: readability-floating-point-format.RequireInitialDigit
+    value: 1
+  - key: llvm-header-guard.UsePragmaOnce
+    value: 1
+  - key: llvm-header-guard.HeaderFileExtensions
+    value: 'h,hpp,hxx,ipp'
+...

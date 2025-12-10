@@ -1,0 +1,20 @@
+Language: Cpp
+BasedOnStyle: LLVM
+
+UseTab: ForIndentation
+IndentWidth: 4
+TabWidth: 4
+
+BreakBeforeBraces: Allman
+BreakBeforeInheritanceComma: false
+SpaceBeforeCtorInitializerColon: false
+NamespaceIndentation: All
+
+SpaceBeforeParens: ControlStatements
+SpaceAfterCStyleCast: true
+SpaceAfterLogicalNot: false
+
+PointerAlignment: Left
+
+InsertNewlineAtEOF: true
+ColumnLimit: 0
