@@ -25,38 +25,19 @@ namespace AudioCore
 			});
 		}
 
-		[[nodiscard]] double norm() const
-		{
-			return Math::Sqrt(std::accumulate(
-				feature.begin(), feature.end(), 0.0,
-				[](const auto& norm, const auto& x)
-				{
-					return norm + x * x;
-				}));
-		}
-
-		[[nodiscard]] double cosineSimilarity(const MFCC& other) const
+		// ユークリッド距離の二乗を計算する (k-NN用).
+		[[nodiscard]] double distSq(const MFCC& other) const
 		{
 			if (feature.size() != other.feature.size())
-				return 0.0;
-			const double thisNorm = norm(), otherNorm = other.norm();
-			if (thisNorm < 1e-8 || otherNorm < 1e-8)
-				return 0.0;
+				return DBL_MAX;
 
-			double innerProduct = 0.0;
+			double sum = 0.0;
 			for (size_t i : step(feature.size()))
-				innerProduct += feature[i] * other.feature[i];
-			return innerProduct / thisNorm / otherNorm;
-		}
-
-		static MFCC Average(const Array<double>& sumBuffer, int32 count)
-		{
-			if (count <= 0 || sumBuffer.isEmpty())
-				return MFCC{};
-			return MFCC{sumBuffer.map([&](double x)
 			{
-				return x / count;
-			})};
+				const double d = feature[i] - other.feature[i];
+				sum += d * d;
+			}
+			return sum;
 		}
 	};
 
@@ -154,19 +135,17 @@ namespace AudioCore
 
 // ============================================================================
 // 2. DanmakuCore: 弾幕ロジック
-//    サンプルの弾幕システムを移植・調整したものです.
+//    サンプルの弾幕システムを移植・調整したものです. (変更なし)
 // ============================================================================
 
 namespace DanmakuCore
 {
-	// 座標がシーン内にあるか判定する関数.
 	bool isOutOfSceneArea(const Vec2& position)
 	{
-		constexpr int margin = 20; // すこし余裕を持たせる.
+		constexpr int margin = 20;
 		return position.x < -margin || position.x > Scene::Width() + margin || position.y < -margin || position.y > Scene::Height() + margin;
 	}
 
-	// 敵弾.
 	struct EnemyBullet
 	{
 		EnemyBullet(const Vec2& _pos, const Vec2& _vel, const Vec2& _acc, float _size)
@@ -187,7 +166,6 @@ namespace DanmakuCore
 		}
 	};
 
-	// 弾幕管理クラス.
 	class BulletCurtain
 	{
 	public:
@@ -361,22 +339,20 @@ namespace GameSystem
 
 	struct Config
 	{
-		static constexpr double InputVolumeThreshold = 0.5;
-		static constexpr double SimilarityThreshold = 0.85;
+		static constexpr double InputVolumeThreshold = 0.1; // 感度を上げるために閾値を低く設定(0.5 -> 0.1).
+		static constexpr int32 K_Nearest = 7; // k-NNの k の値.
 		static constexpr int32 StabilityFrames = 5;
-		static constexpr double PlayerSpeed = 300.0; // 弾幕回避のため少し速めに.
+		static constexpr double PlayerSpeed = 300.0;
 		static constexpr double ShotSpeed = 800.0;
-		static constexpr double ShotCoolTime = 0.15; // 秒.
+		static constexpr double ShotCoolTime = 0.15;
 	};
 
-	// 自機ショット.
 	struct PlayerBullet
 	{
 		Vec2 pos;
 		Vec2 vel;
 	};
 
-	// プレイヤーの実体.
 	class Player
 	{
 	public:
@@ -386,7 +362,6 @@ namespace GameSystem
 
 		void update(const String& command, double deltaTime)
 		{
-			// 移動処理 (い:左, う:上, え:右, お:下).
 			if (command == U"い")
 				m_pos.x -= Config::PlayerSpeed * deltaTime;
 			else if (command == U"う")
@@ -395,10 +370,10 @@ namespace GameSystem
 				m_pos.x += Config::PlayerSpeed * deltaTime;
 			else if (command == U"お")
 				m_pos.y += Config::PlayerSpeed * deltaTime;
+			// command == U"雑音" の場合は何も起きない(停止)
 
 			m_pos = m_pos.clamp(Scene::Rect());
 
-			// ショット発射処理 (あ).
 			m_shotTimer += deltaTime;
 			if (command == U"あ" && m_shotTimer >= Config::ShotCoolTime)
 			{
@@ -406,7 +381,6 @@ namespace GameSystem
 				m_shotTimer = 0.0;
 			}
 
-			// ショットの移動と削除.
 			for (auto& b : m_bullets)
 				b.pos += b.vel * deltaTime;
 			m_bullets.remove_if([](const PlayerBullet& b)
@@ -417,11 +391,9 @@ namespace GameSystem
 
 		void draw() const
 		{
-			// 自機描画.
 			static const Texture playerTexture{U"🤖"_emoji};
 			playerTexture.resized(50).flipped().drawAt(m_pos);
 
-			// ショット描画.
 			for (const auto& b : m_bullets)
 			{
 				Circle{b.pos, 8}.draw(Palette::Orange);
@@ -429,7 +401,6 @@ namespace GameSystem
 			}
 		}
 
-		// リセット用.
 		void reset(const Vec2& pos)
 		{
 			m_pos = pos;
@@ -439,7 +410,6 @@ namespace GameSystem
 		const Vec2& getPos() const { return m_pos; }
 		const Array<PlayerBullet>& getBullets() const { return m_bullets; }
 
-		// 弾が敵に当たったら消す処理.
 		void removeBullet(size_t index)
 		{
 			if (index < m_bullets.size())
@@ -459,23 +429,27 @@ namespace GameSystem
 	struct LearningSlot
 	{
 		String label;
-		MFCC mfcc;
+		Array<MFCC> samples;
 		bool isRecorded = false;
 	};
 
-	// 音声コマンドの管理システム.
+	// 音声コマンドの管理システム (k-NN).
 	class VoiceCommandSystem
 	{
 	public:
 		VoiceCommandSystem()
 		{
+			// "雑音" スロットを追加.
 			m_slots = {
-				{U"あ", {}, false}, {U"い", {}, false}, {U"う", {}, false}, {U"え", {}, false}, {U"お", {}, false}};
+				{U"あ", {}, false}, {U"い", {}, false}, {U"う", {}, false}, {U"え", {}, false}, {U"お", {}, false}, {U"雑音", {}, false}};
 		}
 
 		String detectCommand(const MFCC& inputMFCC, double inputRMS)
 		{
-			if (inputRMS <= VolumeToRMS(Config::InputVolumeThreshold) || inputMFCC.isUnset())
+			// 音量による足切りは極小値(無音に近い場合)のみに行う.
+			// 0.5 などの高い閾値で弾くと、雑音クラスが判定される前に「判定不能」になってしまうため.
+			// ただし MFCC が Unset の場合は判定しようがないので弾く.
+			if (inputMFCC.isUnset())
 			{
 				m_potentialVowel = U"";
 				m_stabilityCount = 0;
@@ -483,57 +457,86 @@ namespace GameSystem
 				return m_confirmedVowel;
 			}
 
-			String bestLabel = U"";
-			double maxSimilarity = 0.0;
-			int bestIndex = -1;
-
-			for (size_t i : step(m_slots.size()))
+			// k-NN アルゴリズム.
+			struct Neighbor
 			{
-				double similarity = inputMFCC.cosineSimilarity(m_slots[i].mfcc);
-				if (similarity > maxSimilarity)
+				double distSq;
+				int32 slotIndex;
+			};
+			Array<Neighbor> neighbors;
+
+			for (int32 i : step(m_slots.size()))
+			{
+				for (const auto& sample : m_slots[i].samples)
 				{
-					maxSimilarity = similarity;
-					bestIndex = static_cast<int>(i);
+					double d = inputMFCC.distSq(sample);
+					neighbors.push_back({d, i});
 				}
 			}
 
-			if (bestIndex != -1 && maxSimilarity > Config::SimilarityThreshold)
+			String bestLabel = U"";
+
+			if (not neighbors.isEmpty())
 			{
-				bestLabel = m_slots[bestIndex].label;
+				size_t k = Min<size_t>(Config::K_Nearest, neighbors.size());
+				std::partial_sort(neighbors.begin(), neighbors.begin() + k, neighbors.end(),
+				                  [](const Neighbor& a, const Neighbor& b)
+				                  {
+					                  return a.distSq < b.distSq;
+				                  });
+
+				HashTable<int32, int32> votes;
+				for (size_t i : step(k))
+				{
+					votes[neighbors[i].slotIndex]++;
+				}
+
+				int32 bestSlotIndex = -1;
+				int32 maxVotes = -1;
+				for (auto [slotIndex, count] : votes)
+				{
+					if (count > maxVotes)
+					{
+						maxVotes = count;
+						bestSlotIndex = slotIndex;
+					}
+				}
+
+				if (bestSlotIndex != -1)
+				{
+					bestLabel = m_slots[bestSlotIndex].label;
+				}
 			}
 
+			// チャタリング対策.
 			updateStability(bestLabel);
+
 			return m_confirmedVowel;
 		}
 
 		void accumulateForLearning(const MFCC& mfcc)
 		{
-			if (m_learningBufferSum.isEmpty())
-				m_learningBufferSum.resize(mfcc.feature.size(), 0.0);
-			for (size_t i : step(m_learningBufferSum.size()))
-				m_learningBufferSum[i] += mfcc.feature[i];
-			m_learningSampleCount++;
+			m_learningBuffer.push_back(mfcc);
 		}
 
 		void resetLearningBuffer()
 		{
-			m_learningBufferSum.clear();
-			m_learningSampleCount = 0;
+			m_learningBuffer.clear();
 		}
 
 		bool commitLearning(int32 slotIndex)
 		{
 			if (slotIndex < 0 || slotIndex >= (int32) m_slots.size())
 				return false;
-			if (m_learningSampleCount <= 10)
+			if (m_learningBuffer.size() <= 5)
 				return false;
 
-			m_slots[slotIndex].mfcc = MFCC::Average(m_learningBufferSum, m_learningSampleCount);
+			m_slots[slotIndex].samples = m_learningBuffer;
 			m_slots[slotIndex].isRecorded = true;
 			return true;
 		}
 
-		int32 getLearningSampleCount() const { return m_learningSampleCount; }
+		int32 getLearningSampleCount() const { return static_cast<int32>(m_learningBuffer.size()); }
 		Array<LearningSlot>& getSlots() { return m_slots; }
 		const Array<LearningSlot>& getSlots() const { return m_slots; }
 
@@ -549,8 +552,8 @@ namespace GameSystem
 
 	private:
 		Array<LearningSlot> m_slots;
-		Array<double> m_learningBufferSum;
-		int32 m_learningSampleCount = 0;
+		Array<MFCC> m_learningBuffer;
+
 		String m_potentialVowel = U"";
 		String m_confirmedVowel = U"";
 		int32 m_stabilityCount = 0;
@@ -630,16 +633,22 @@ namespace UserInterface
 			if (KeyLeft.down())
 				m_selectedSlotIndex = (m_selectedSlotIndex + (int32) slots.size() - 1) % slots.size();
 
+			// スロット数に合わせて動的にレイアウト計算.
+			const int32 slotCount = static_cast<int32>(slots.size());
 			const int32 boxSize = 100;
 			const int32 gap = 20;
-			const int32 startX = (Scene::Width() - (boxSize * 5 + gap * 4)) / 2;
+			// 全体の幅を計算してセンタリング.
+			const int32 startX = (Scene::Width() - (boxSize * slotCount + gap * (slotCount - 1))) / 2;
 			const int32 startY = 200;
 
 			for (int32 i : step(slots.size()))
 			{
 				const Rect box{startX + i * (boxSize + gap), startY, boxSize, boxSize};
 				const bool isSelected = (i == m_selectedSlotIndex);
-				const bool isRecordingInput = KeySpace.pressed() && rms > VolumeToRMS(Config::InputVolumeThreshold);
+				const bool isNoiseSlot = (slots[i].label == U"雑音");
+
+				// 雑音スロットなら音量が小さくても許可、それ以外は閾値以上で許可.
+				const bool isRecordingInput = KeySpace.pressed() && (isNoiseSlot || rms > VolumeToRMS(Config::InputVolumeThreshold));
 				const bool isRecordingNow = isSelected && isRecordingInput;
 
 				if (box.leftClicked())
@@ -653,7 +662,8 @@ namespace UserInterface
 				if (slots[i].isRecorded)
 					m_smallFont(U"OK").drawAt(box.bottomCenter().movedBy(0, -20), Palette::Lightgreen);
 
-				if (isRecordingNow)
+				// 録音中(音量閾値超え)でなくても、選択中でデータがバッファにあれば表示し続ける.
+				if (isSelected && m_voiceSystem.getLearningSampleCount() > 0)
 				{
 					const double progress = Min(m_voiceSystem.getLearningSampleCount() / 60.0, 1.0);
 					Circle{box.center(), 40}.drawArc(0_deg, 360_deg * progress, 4, 0, Palette::Orange);
@@ -671,7 +681,6 @@ namespace UserInterface
 				if (startBtn.leftClicked() || KeyEnter.down())
 				{
 					m_isGameMode = true;
-					// ゲーム開始時にリセット.
 					m_bulletCurtain.clear();
 					m_bulletCurtain.start();
 					m_player.reset(Vec2{400, 500});
@@ -686,9 +695,13 @@ namespace UserInterface
 
 		void handleRecordingLogic(const MFCC& mfcc, double rms)
 		{
+			bool isNoiseSlot = (m_voiceSystem.getSlots()[m_selectedSlotIndex].label == U"雑音");
+
 			if (KeySpace.down())
 				m_voiceSystem.resetLearningBuffer();
-			if (KeySpace.pressed() && rms > VolumeToRMS(Config::InputVolumeThreshold) && !mfcc.isUnset())
+
+			// 雑音スロットなら音量が小さくてもMFCCが取れていれば学習する.
+			if (KeySpace.pressed() && (isNoiseSlot || rms > VolumeToRMS(Config::InputVolumeThreshold)) && !mfcc.isUnset())
 			{
 				m_voiceSystem.accumulateForLearning(mfcc);
 			}
@@ -714,7 +727,6 @@ namespace UserInterface
 
 		void updateGamePhase(const MFCC& mfcc, double rms)
 		{
-			// 背景.
 			Scene::SetBackground(ColorF{0.1, 0.2, 0.7});
 			for (auto i : step(12))
 			{
@@ -722,20 +734,14 @@ namespace UserInterface
 				Rect{0, (i * 50), 800, 50}.draw(ColorF(1.0, a * 0.2));
 			}
 
-			// コマンド判定.
 			String command = m_voiceSystem.detectCommand(mfcc, rms);
 			String potential = m_voiceSystem.getPotentialVowel();
 
-			// 弾幕更新.
 			m_bulletCurtain.update(m_enemyPos);
-
-			// プレイヤー更新.
 			m_player.update(command, Scene::DeltaTime());
 
-			// 当たり判定: 敵弾 vs 自機.
 			if (m_bulletCurtain.checkHit(m_player.getPos(), 4.0))
 			{
-				// 爆発エフェクト.
 				m_effect.add([pos = m_player.getPos()](double t)
 				{
 					const double t2 = (1.0 - t);
@@ -743,18 +749,15 @@ namespace UserInterface
 					return (t < 1.0);
 				});
 
-				// ゲームオーバーリセット.
 				m_player.reset(Vec2{400, 500});
 				m_bulletCurtain.clear();
 				m_bulletCurtain.start();
 				m_score = 0;
 			}
 
-			// 当たり判定: 自機弾 vs 敵.
-			// 簡易的な処理として、敵の中心付近に当たったらヒットとする.
 			for (const auto& bullet : m_player.getBullets())
 			{
-				if (bullet.pos.distanceFrom(m_enemyPos) < 40.0) // 敵の当たり判定サイズ.
+				if (bullet.pos.distanceFrom(m_enemyPos) < 40.0)
 				{
 					m_score += 100;
 					m_effect.add([pos = bullet.pos](double t)
@@ -762,17 +765,14 @@ namespace UserInterface
 						Circle{pos, t * 30}.drawFrame(2, Palette::Orange);
 						return t < 0.5;
 					});
-					// 弾を消す処理は複雑になるので今回は省略(貫通)するか、または描画側で制御してもよい.
 				}
 			}
 
-			// 描画.
-			m_enemyTexture.resized(60).drawAt(m_enemyPos); // 敵.
-			m_bulletCurtain.draw(); // 弾幕.
-			m_player.draw(); // 自機.
-			m_effect.update(); // エフェクト.
+			m_enemyTexture.resized(60).drawAt(m_enemyPos);
+			m_bulletCurtain.draw();
+			m_player.draw();
+			m_effect.update();
 
-			// UI表示.
 			if (command)
 				m_font(command).drawAt(Scene::Center().movedBy(0, -200), Palette::White);
 			else if (potential)
@@ -781,7 +781,6 @@ namespace UserInterface
 			m_font(U"Score: {}"_fmt(m_score)).draw(20, 20, Palette::White);
 			m_smallFont(U"あ:ショット  い:←  う:↑  え:→  お:↓").drawAt(Scene::Width() / 2, Scene::Height() - 30, Palette::White);
 
-			// 再学習ボタン.
 			if (SimpleGUI::Button(U"再学習", Vec2{20, 80}))
 			{
 				m_isGameMode = false;
