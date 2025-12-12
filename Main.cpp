@@ -608,6 +608,8 @@ namespace UserInterface
 	private:
 		bool m_isGameMode = false;
 		int32 m_selectedSlotIndex = 0;
+		bool m_isMousePressed = false;
+		bool m_wasMousePressed = false;
 
 		Player m_player;
 		VoiceCommandSystem m_voiceSystem;
@@ -624,14 +626,9 @@ namespace UserInterface
 		void updateLearningPhase(const MFCC& mfcc, double rms)
 		{
 			Scene::SetBackground(Palette::Darkgray);
-			m_font(U"学習モード: 選択してSPACEキーを長押し").drawAt(Scene::Width() / 2, 50, Palette::White);
+			m_font(U"学習モード: 音声を登録").drawAt(Scene::Width() / 2, 50, Palette::White);
 
 			auto& slots = m_voiceSystem.getSlots();
-
-			if (KeyRight.down())
-				m_selectedSlotIndex = (m_selectedSlotIndex + 1) % slots.size();
-			if (KeyLeft.down())
-				m_selectedSlotIndex = (m_selectedSlotIndex + (int32) slots.size() - 1) % slots.size();
 
 			// スロット数に合わせて動的にレイアウト計算.
 			const int32 slotCount = static_cast<int32>(slots.size());
@@ -641,15 +638,27 @@ namespace UserInterface
 			const int32 startX = (Scene::Width() - (boxSize * slotCount + gap * (slotCount - 1))) / 2;
 			const int32 startY = 200;
 
+			// ナビゲーションボタン用のレイアウト
+			const Rect prevBtn = Rect{Arg::center(startX - 80, startY + 50), 60, 60};
+			const Rect nextBtn = Rect{Arg::center(Scene::Width() - startX + 80, startY + 50), 60, 60};
+
+			// 前へボタン
+			prevBtn.rounded(10).draw(prevBtn.mouseOver() ? Palette::Lightblue : Palette::Steelblue);
+			m_smallFont(U"←").drawAt(prevBtn.center(), Palette::White);
+			if (prevBtn.leftClicked())
+				m_selectedSlotIndex = (m_selectedSlotIndex + (int32) slots.size() - 1) % slots.size();
+
+			// 次へボタン
+			nextBtn.rounded(10).draw(nextBtn.mouseOver() ? Palette::Lightblue : Palette::Steelblue);
+			m_smallFont(U"→").drawAt(nextBtn.center(), Palette::White);
+			if (nextBtn.leftClicked())
+				m_selectedSlotIndex = (m_selectedSlotIndex + 1) % slots.size();
+
 			for (int32 i : step(slots.size()))
 			{
 				const Rect box{startX + i * (boxSize + gap), startY, boxSize, boxSize};
 				const bool isSelected = (i == m_selectedSlotIndex);
 				const bool isNoiseSlot = (slots[i].label == U"雑音");
-
-				// 雑音スロットなら音量が小さくても許可、それ以外は閾値以上で許可.
-				const bool isRecordingInput = KeySpace.pressed() && (isNoiseSlot || rms > VolumeToRMS(Config::InputVolumeThreshold));
-				const bool isRecordingNow = isSelected && isRecordingInput;
 
 				if (box.leftClicked())
 					m_selectedSlotIndex = i;
@@ -662,7 +671,7 @@ namespace UserInterface
 				if (slots[i].isRecorded)
 					m_smallFont(U"OK").drawAt(box.bottomCenter().movedBy(0, -20), Palette::Lightgreen);
 
-				// 録音中(音量閾値超え)でなくても、選択中でデータがバッファにあれば表示し続ける.
+				// 録音中でデータがバッファにあれば表示し続ける.
 				if (isSelected && m_voiceSystem.getLearningSampleCount() > 0)
 				{
 					const double progress = Min(m_voiceSystem.getLearningSampleCount() / 60.0, 1.0);
@@ -678,7 +687,7 @@ namespace UserInterface
 				startBtn.rounded(10).draw(startBtn.mouseOver() ? Palette::Orange : Palette::Darkorange);
 				m_font(U"ゲーム開始").drawAt(startBtn.center(), Palette::White);
 
-				if (startBtn.leftClicked() || KeyEnter.down())
+				if (startBtn.leftClicked())
 				{
 					m_isGameMode = true;
 					m_bulletCurtain.clear();
@@ -695,22 +704,37 @@ namespace UserInterface
 
 		void handleRecordingLogic(const MFCC& mfcc, double rms)
 		{
-			bool isNoiseSlot = (m_voiceSystem.getSlots()[m_selectedSlotIndex].label == U"雑音");
+			auto& slots = m_voiceSystem.getSlots();
+			const int32 slotCount = static_cast<int32>(slots.size());
+			const int32 boxSize = 100;
+			const int32 gap = 20;
+			const int32 startX = (Scene::Width() - (boxSize * slotCount + gap * (slotCount - 1))) / 2;
+			const int32 startY = 200;
 
-			if (KeySpace.down())
+			const Rect selectedBox{startX + m_selectedSlotIndex * (boxSize + gap), startY, boxSize, boxSize};
+			bool isNoiseSlot = (slots[m_selectedSlotIndex].label == U"雑音");
+
+			m_isMousePressed = MouseL.pressed();
+
+			// マウスボタンが押された時点でバッファをリセット
+			if (m_isMousePressed && !m_wasMousePressed)
+			{
 				m_voiceSystem.resetLearningBuffer();
+			}
 
-			// 雑音スロットなら音量が小さくてもMFCCが取れていれば学習する.
-			if (KeySpace.pressed() && (isNoiseSlot || rms > VolumeToRMS(Config::InputVolumeThreshold)) && !mfcc.isUnset())
+			// 選択ボックス内でマウスが押されている間、音声を蓄積
+			if (selectedBox.mouseOver() && m_isMousePressed && (isNoiseSlot || rms > VolumeToRMS(Config::InputVolumeThreshold)) && !mfcc.isUnset())
 			{
 				m_voiceSystem.accumulateForLearning(mfcc);
 			}
-			if (KeySpace.up())
+
+			// マウスボタンが離された時に学習を確定
+			if (!m_isMousePressed && m_wasMousePressed)
 			{
 				bool success = m_voiceSystem.commitLearning(m_selectedSlotIndex);
 				if (success)
 				{
-					const auto& slots = m_voiceSystem.getSlots();
+					// 学習成功時に次の未学習スロットに自動移動
 					for (int32 k = 1; k < (int32) slots.size(); ++k)
 					{
 						int32 nextIdx = (m_selectedSlotIndex + k) % slots.size();
@@ -723,6 +747,8 @@ namespace UserInterface
 				}
 				m_voiceSystem.resetLearningBuffer();
 			}
+
+			m_wasMousePressed = m_isMousePressed;
 		}
 
 		void updateGamePhase(const MFCC& mfcc, double rms)
