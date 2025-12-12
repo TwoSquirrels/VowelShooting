@@ -391,8 +391,7 @@ namespace GameSystem
 
 		void draw() const
 		{
-			static const Texture playerTexture{U"🤖"_emoji};
-			playerTexture.resized(50).flipped().drawAt(m_pos);
+			Circle{m_pos, 15}.draw(ColorF{0.25, 0.25, 0.28});
 
 			for (const auto& b : m_bullets)
 			{
@@ -439,9 +438,9 @@ namespace GameSystem
 	public:
 		VoiceCommandSystem()
 		{
-			// "雑音" スロットを追加.
+			// "雑音" スロットを一番左に配置.
 			m_slots = {
-				{U"あ", {}, false}, {U"い", {}, false}, {U"う", {}, false}, {U"え", {}, false}, {U"お", {}, false}, {U"雑音", {}, false}};
+				{U"雑音", {}, false}, {U"あ", {}, false}, {U"い", {}, false}, {U"う", {}, false}, {U"え", {}, false}, {U"お", {}, false}};
 		}
 
 		String detectCommand(const MFCC& inputMFCC, double inputRMS)
@@ -481,7 +480,7 @@ namespace GameSystem
 				size_t k = Min<size_t>(Config::K_Nearest, neighbors.size());
 				std::partial_sort(neighbors.begin(), neighbors.begin() + k, neighbors.end(),
 				                  [](const Neighbor& a, const Neighbor& b)
-			                  {
+				                  {
 					                  return a.distSq < b.distSq;
 				                  });
 
@@ -528,7 +527,7 @@ namespace GameSystem
 		{
 			if (slotIndex < 0 || slotIndex >= (int32) m_slots.size())
 				return false;
-			if (m_learningBuffer.size() <= 5)
+			if (m_learningBuffer.size() <= 60)
 				return false;
 
 			m_slots[slotIndex].samples = m_learningBuffer;
@@ -654,18 +653,31 @@ namespace UserInterface
 			if (nextBtn.leftClicked())
 				m_selectedSlotIndex = (m_selectedSlotIndex + 1) % slots.size();
 
+			// 音声判定を実行（学習用）
+			String detectedCommand = m_voiceSystem.detectCommand(mfcc, rms);
+
 			for (int32 i : step(slots.size()))
 			{
 				const Rect box{startX + i * (boxSize + gap), startY, boxSize, boxSize};
 				const bool isSelected = (i == m_selectedSlotIndex);
 				const bool isNoiseSlot = (slots[i].label == U"雑音");
+				const bool isDetected = (detectedCommand == slots[i].label && !detectedCommand.isEmpty());
 
 				if (box.leftClicked())
 					m_selectedSlotIndex = i;
 
-				box.rounded(10).draw(isSelected ? ColorF{0.3, 0.3, 0.4} : ColorF{0.2});
-				if (isSelected)
-					box.rounded(10).drawFrame(4, Palette::Skyblue);
+				// 判定されたボタンは異なる見た目でハイライト
+				if (isDetected)
+				{
+					box.rounded(10).draw(ColorF{0.5, 0.8, 0.5});
+					box.rounded(10).drawFrame(4, Palette::Limegreen);
+				}
+				else
+				{
+					box.rounded(10).draw(isSelected ? ColorF{0.3, 0.3, 0.4} : ColorF{0.2});
+					if (isSelected)
+						box.rounded(10).drawFrame(4, Palette::Skyblue);
+				}
 
 				m_font(slots[i].label).drawAt(box.center(), Palette::White);
 				if (slots[i].isRecorded)
@@ -680,6 +692,9 @@ namespace UserInterface
 			}
 
 			handleRecordingLogic(mfcc, rms);
+
+			// 操作方法の表示
+			m_smallFont(U"操作方法：選択したボックスをマウスで押しながら音声を話してください").drawAt(Scene::Width() / 2, 120, Palette::White);
 
 			if (m_voiceSystem.isAllRecorded())
 			{
@@ -734,15 +749,19 @@ namespace UserInterface
 				bool success = m_voiceSystem.commitLearning(m_selectedSlotIndex);
 				if (success)
 				{
-					// 学習成功時に次の未学習スロットに自動移動
-					for (int32 k = 1; k < (int32) slots.size(); ++k)
+					// 学習成功時に未学習スロットの中で一番左のものに移動
+					int32 leftmostUnrecorded = -1;
+					for (int32 k = 0; k < (int32) slots.size(); ++k)
 					{
-						int32 nextIdx = (m_selectedSlotIndex + k) % slots.size();
-						if (!slots[nextIdx].isRecorded)
+						if (!slots[k].isRecorded)
 						{
-							m_selectedSlotIndex = nextIdx;
+							leftmostUnrecorded = k;
 							break;
 						}
+					}
+					if (leftmostUnrecorded != -1)
+					{
+						m_selectedSlotIndex = leftmostUnrecorded;
 					}
 				}
 				m_voiceSystem.resetLearningBuffer();
@@ -799,13 +818,29 @@ namespace UserInterface
 			m_player.draw();
 			m_effect.update();
 
-			if (command)
-				m_font(command).drawAt(Scene::Center().movedBy(0, -200), Palette::White);
-			else if (potential)
-				m_font(potential).drawAt(Scene::Center().movedBy(0, -200), ColorF{1.0, 0.5});
+			// プレイヤーの周りに「あいうえお」を表示
+			const Vec2 playerPos = m_player.getPos();
+			const double radius = 30.0;
+
+			// あ: 中央, い: 左, う: 上, え: 右, お: 下
+			Array<std::pair<String, Vec2>> vowelPositions = {
+				{U"あ", Vec2(0, 0)},
+				{U"い", Vec2(-1, 0)},
+				{U"う", Vec2(0, -1)},
+				{U"え", Vec2(1, 0)},
+				{U"お", Vec2(0, 1)}
+			};
+
+			for (const auto& [vowel, direction] : vowelPositions)
+			{
+				const Vec2 pos = playerPos + radius * direction;
+				const bool isActive = (command == vowel && !command.isEmpty());
+
+				m_smallFont(vowel).drawAt(pos, isActive ? Palette::Yellow : Palette::White);
+			}
 
 			m_font(U"Score: {}"_fmt(m_score)).draw(20, 20, Palette::White);
-			m_smallFont(U"あ:ショット  い:←  う:↑  え:→  お:↓").drawAt(Scene::Width() / 2, Scene::Height() - 30, Palette::White);
+			m_smallFont(U"あ: ショット   いうえお: 移動").drawAt(Scene::Width() / 2, Scene::Height() - 30, Palette::White);
 
 			if (SimpleGUI::Button(U"再学習", Vec2{20, 80}))
 			{
