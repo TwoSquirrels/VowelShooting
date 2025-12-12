@@ -252,30 +252,30 @@ namespace DanmakuCore
 		{
 			if (triggerMs(500))
 			{
-				constexpr int perNum = 5;
+				constexpr int perNum = 3; // 5 -> 3
 				for (int i = 0; i < perNum; ++i)
 				{
 					const double angle = 2 * Math::Pi / perNum * i;
-					mBulletMap[eSpin].emplace_back(EnemyBullet(enemyPos, 120.f * Vec2(cos(angle), sin(angle)), Vec2::Zero(), 10));
+					mBulletMap[eSpin].emplace_back(EnemyBullet(enemyPos, 80.f * Vec2(cos(angle), sin(angle)), Vec2::Zero(), 10)); // 120.f -> 80.f
 				}
 			}
 
-			if (passedMs(700) && !passedMs(9000) && periodMs(150))
+			if (passedMs(700) && !passedMs(9000) && periodMs(250)) // 150 -> 250
 			{
-				constexpr double speed = 1.35;
+				constexpr double speed = 1.0; // 1.35 -> 1.0
 				for (const auto& spinBullet : mBulletMap[eSpin])
 				{
 					mBulletMap[eTail].emplace_back(EnemyBullet(spinBullet.pos, -speed * spinBullet.vel.rotated(-Math::Pi / 2), Vec2::Zero(), 7));
 				}
 			}
 
-			if (periodMs(1000 + RandomInt32() % 150))
+			if (periodMs(1500 + RandomInt32() % 200)) // 1000 + RandomInt32() % 150 -> 1500 + RandomInt32() % 200
 			{
-				constexpr int perNum = 3;
+				constexpr int perNum = 2; // 3 -> 2
 				for (int i = 0; i < perNum; ++i)
 				{
 					const double genPos = Random() * 500.0 - 250.0;
-					const double speed = Random() * 15.0 + 10.0;
+					const double speed = Random() * 10.0 + 6.0; // Random() * 15.0 + 10.0 -> Random() * 10.0 + 6.0
 					mBulletMap[eSnow].emplace_back(EnemyBullet(Vec2(genPos, -genPos), Vec2::Zero(), Vec2(speed, 1.2 * speed), 5));
 				}
 			}
@@ -283,7 +283,7 @@ namespace DanmakuCore
 			if (triggerMs(9000))
 			{
 				for (auto& spinBullet : mBulletMap[eSpin])
-					spinBullet.acc = 3.0 * spinBullet.vel;
+					spinBullet.acc = 2.0 * spinBullet.vel; // 3.0 -> 2.0
 			}
 		}
 
@@ -342,8 +342,8 @@ namespace GameSystem
 		static constexpr double InputVolumeThreshold = 0.1; // 感度を上げるために閾値を低く設定(0.5 -> 0.1).
 		static constexpr int32 K_Nearest = 7; // k-NNの k の値.
 		static constexpr int32 StabilityFrames = 5;
-		static constexpr double PlayerSpeed = 300.0;
-		static constexpr double ShotSpeed = 800.0;
+		static constexpr double PlayerSpeed = 150.0; // 200.0 -> 150.0
+		static constexpr double ShotSpeed = 500.0; // 800.0 -> 500.0
 		static constexpr double ShotCoolTime = 0.15;
 	};
 
@@ -481,7 +481,7 @@ namespace GameSystem
 				size_t k = Min<size_t>(Config::K_Nearest, neighbors.size());
 				std::partial_sort(neighbors.begin(), neighbors.begin() + k, neighbors.end(),
 				                  [](const Neighbor& a, const Neighbor& b)
-				                  {
+			                  {
 					                  return a.distSq < b.distSq;
 				                  });
 
