@@ -1,13 +1,7 @@
 ﻿#include <Siv3D.hpp> // Siv3D v0.6.16
 
-// ============================================================================
-// 1. AudioCore: 音声解析の基盤
-//    MFCC抽出などの数学的な処理を担当します. (変更なし)
-// ============================================================================
-
 namespace AudioCore
 {
-	// 音量の RMS 変換ヘルパー.
 	[[nodiscard]] double VolumeToRMS(const double volume)
 	{
 		return Clamp(Math::Pow(10.0, (volume - 1.0) * 5.0), 0.0, 1.0);
@@ -19,13 +13,9 @@ namespace AudioCore
 
 		[[nodiscard]] bool isUnset() const
 		{
-			return std::ranges::all_of(feature, [](const double x)
-			{
-				return x == 0.0;
-			});
+			return std::ranges::all_of(feature, [](const double x) { return x == 0.0; });
 		}
 
-		// ユークリッド距離の二乗を計算する (k-NN用).
 		[[nodiscard]] double distSq(const MFCC& other) const
 		{
 			if (feature.size() != other.feature.size())
@@ -44,120 +34,152 @@ namespace AudioCore
 	class MFCCAnalyzer
 	{
 	public:
-		static [[nodiscard]] double freqToMel(const double freq)
+		[[nodiscard]] static double freqToMel(const double freq)
 		{
 			return 1127.01 * Math::Log(1.0 + freq / 700.0);
 		}
 
-		static [[nodiscard]] double melToFreq(const double mel)
+		[[nodiscard]] static double melToFreq(const double mel)
 		{
 			return 700.0 * (Math::Exp(mel / 1127.01) - 1.0);
 		}
 
-		explicit MFCCAnalyzer(const FFTSampleLength frames = FFTSampleLength::SL2K, const size_t melChannels = 40, const size_t mfccOrder = 12)
-			: frames(frames), f(256uLL << FromEnum(frames), 0.0f), melChannels(melChannels), bin(melChannels + 2),
-			  melSpectrum(melChannels), melEnvelope(melChannels), mfccOrder(mfccOrder)
+		explicit MFCCAnalyzer(
+			const FFTSampleLength frames = FFTSampleLength::SL2K,
+			const size_t melChannels = 40,
+			const size_t mfccOrder = 12)
+			: m_frames(frames)
+			, m_melChannels(melChannels)
+			, m_mfccOrder(mfccOrder)
+			, m_f(256uLL << FromEnum(frames), 0.0f)
+			, m_bin(melChannels + 2)
+			, m_melSpectrum(melChannels)
+			, m_melEnvelope(melChannels)
 		{
 		}
 
 		[[nodiscard]] MFCC analyze(const Microphone& mic)
 		{
 			if (not mic.isLoop())
-				throw Error{U"Microphone is must be loop mode."};
-			if (not mic.isRecording() || mic.getBufferLength() < f.size())
-				return MFCC{Array<double>(mfccOrder, 0.0)};
+				throw Error{U"Microphone must be in loop mode."};
+
+			if (not mic.isRecording() || mic.getBufferLength() < m_f.size())
+				return MFCC{Array<double>(m_mfccOrder, 0.0)};
 
 			const auto sampleRate = mic.getSampleRate();
 			const auto& buffer = mic.getBuffer();
 			const size_t writePos = mic.posSample();
 
-			for (size_t pos : step(f.size()))
+			copyBufferWithPreEmphasis(buffer, writePos, mic.getBufferLength());
+			applyHammingWindow();
+
+			FFT::Analyze(m_fftResult, m_f.data(), m_f.size(), sampleRate, m_frames);
+
+			computeMelFilterBank(sampleRate);
+			return computeMFCC();
+		}
+
+	private:
+		static constexpr float PreEmphasisCoeff = 0.96875f;
+
+		FFTSampleLength m_frames;
+		size_t m_melChannels;
+		size_t m_mfccOrder;
+		Array<float> m_f;
+		Array<size_t> m_bin;
+		Array<double> m_melSpectrum;
+		Array<Vec2> m_melEnvelope;
+		FFTResult m_fftResult;
+
+		void copyBufferWithPreEmphasis(const Array<WaveSample>& buffer, size_t writePos, size_t bufferLength)
+		{
+			for (size_t pos : step(m_f.size()))
 			{
-				const size_t idx = (pos + writePos < f.size() ? mic.getBufferLength() : 0) + pos + writePos - f.size();
-				f[pos] = buffer[idx].left;
+				const size_t idx = (pos + writePos < m_f.size() ? bufferLength : 0) + pos + writePos - m_f.size();
+				m_f[pos] = buffer[idx].left;
 			}
 
-			for (size_t i : Range(f.size() - 1, 1, -1))
-				f[i] -= f[i - 1] * 0.96875f;
+			for (size_t i = m_f.size() - 1; i >= 1; --i)
+				m_f[i] -= m_f[i - 1] * PreEmphasisCoeff;
+		}
 
-			for (size_t i : Range(f.size() - 2, 1))
-				f[i] *= static_cast<float>(0.54 - 0.46 * cos(2.0 * Math::Pi * i / (f.size() - 1)));
-			f.front() = 0.0f;
-			f.back() = 0.0f;
+		void applyHammingWindow()
+		{
+			const size_t n = m_f.size();
+			m_f.front() = 0.0f;
+			m_f.back() = 0.0f;
 
-			FFT::Analyze(fftResult, f.data(), f.size(), sampleRate, frames);
+			for (size_t i = 1; i < n - 1; ++i)
+				m_f[i] *= static_cast<float>(0.54 - 0.46 * std::cos(2.0 * Math::Pi * i / (n - 1)));
+		}
 
-			const auto melMax = freqToMel(static_cast<double>(sampleRate) / 2.0);
-			const auto melMin = freqToMel(0);
-			const auto deltaMel = (melMax - melMin) / static_cast<double>(melChannels + 1);
+		void computeMelFilterBank(uint32 sampleRate)
+		{
+			const double melMax = freqToMel(static_cast<double>(sampleRate) / 2.0);
+			const double melMin = freqToMel(0);
+			const double deltaMel = (melMax - melMin) / static_cast<double>(m_melChannels + 1);
 
-			for (size_t i : step(bin.size()))
+			for (size_t i : step(m_bin.size()))
+				m_bin[i] = static_cast<size_t>((m_f.size() + 1) * melToFreq(melMin + i * deltaMel) / sampleRate);
+
+			for (size_t i : step(m_melChannels))
 			{
-				bin[i] = static_cast<size_t>((f.size() + 1) * melToFreq(melMin + i * deltaMel) / sampleRate);
+				m_melSpectrum[i] = 0.0;
+
+				for (size_t j = m_bin[i]; j < m_bin[i + 1]; ++j)
+					m_melSpectrum[i] += static_cast<double>(m_fftResult.buffer[j]) * (j - m_bin[i]) / (m_bin[i + 1] - m_bin[i]);
+
+				for (size_t j = m_bin[i + 1]; j < m_bin[i + 2]; ++j)
+					m_melSpectrum[i] += static_cast<double>(m_fftResult.buffer[j]) * (m_bin[i + 2] - j) / (m_bin[i + 2] - m_bin[i + 1]);
+
+				m_melEnvelope[i] = {2.0 * m_bin[i + 1] / m_f.size(), m_melSpectrum[i] / (m_bin[i + 2] - m_bin[i])};
 			}
+		}
 
-			for (size_t i : step(melChannels))
-			{
-				melSpectrum[i] = 0.0;
-				for (size_t j : Range(bin[i], bin[i + 1] - 1))
-				{
-					melSpectrum[i] += static_cast<double>(fftResult.buffer[j]) * (j - bin[i]) / (bin[i + 1] - bin[i]);
-				}
-				for (size_t j : Range(bin[i + 1], bin[i + 2] - 1))
-				{
-					melSpectrum[i] += static_cast<double>(fftResult.buffer[j]) * (bin[i + 2] - j) / (bin[i + 2] - bin[i + 1]);
-				}
-				melEnvelope[i] = {2.0 * bin[i + 1] / f.size(), melSpectrum[i] / (bin[i + 2] - bin[i])};
-			}
+		[[nodiscard]] MFCC computeMFCC() const
+		{
+			MFCC mfcc{Array<double>(m_mfccOrder, 0.0)};
 
-			MFCC mfcc{Array<double>(mfccOrder, 0.0)};
-			for (size_t i : Range(1, mfccOrder))
+			for (size_t i = 1; i <= m_mfccOrder; ++i)
 			{
-				for (size_t j : step(melChannels))
+				for (size_t j : step(m_melChannels))
 				{
-					mfcc.feature[i - 1] += Math::Log10(Math::Abs(melSpectrum[j])) * Math::Cos(Math::Pi * i * (j + 0.5) / melChannels) * 10;
+					mfcc.feature[i - 1] += Math::Log10(Math::Abs(m_melSpectrum[j]))
+						* Math::Cos(Math::Pi * i * (j + 0.5) / m_melChannels) * 10;
 				}
 			}
 			return mfcc;
 		}
-
-	protected:
-		FFTSampleLength frames;
-		Array<float> f;
-		FFTResult fftResult;
-		size_t melChannels;
-		Array<size_t> bin;
-		Array<double> melSpectrum;
-		Array<Vec2> melEnvelope;
-		size_t mfccOrder;
 	};
-} // namespace AudioCore
-
-// ============================================================================
-// 2. DanmakuCore: 弾幕ロジック
-//    サンプルの弾幕システムを移植・調整したものです. (変更なし)
-// ============================================================================
+}
 
 namespace DanmakuCore
 {
-	bool isOutOfSceneArea(const Vec2& position)
+	namespace
 	{
-		constexpr int margin = 20;
-		return position.x < -margin || position.x > Scene::Width() + margin || position.y < -margin || position.y > Scene::Height() + margin;
+		constexpr int32 SceneMargin = 20;
+
+		[[nodiscard]] bool isOutOfSceneArea(const Vec2& position)
+		{
+			return position.x < -SceneMargin
+				|| position.x > Scene::Width() + SceneMargin
+				|| position.y < -SceneMargin
+				|| position.y > Scene::Height() + SceneMargin;
+		}
 	}
 
 	struct EnemyBullet
 	{
-		EnemyBullet(const Vec2& _pos, const Vec2& _vel, const Vec2& _acc, float _size)
-			: pos(_pos), vel(_vel), acc(_acc), size(_size), stopwatch(StartImmediately::Yes)
-		{
-		}
-
 		Vec2 pos;
 		Vec2 vel;
 		Vec2 acc;
 		double size;
-		Stopwatch stopwatch;
+		Stopwatch stopwatch{StartImmediately::Yes};
+
+		EnemyBullet(const Vec2& pos_, const Vec2& vel_, const Vec2& acc_, double size_)
+			: pos(pos_), vel(vel_), acc(acc_), size(size_)
+		{
+		}
 
 		void update()
 		{
@@ -171,146 +193,143 @@ namespace DanmakuCore
 	public:
 		BulletCurtain()
 		{
-			mWholePeriod = 10000;
-			mBulletMap.emplace(eSpin, Array<EnemyBullet>());
-			mBulletMap.emplace(eTail, Array<EnemyBullet>());
-			mBulletMap.emplace(eSnow, Array<EnemyBullet>());
-			mPrevEnemyPos = Vec2::Zero();
+			for (int key : {eSpin, eTail, eSnow})
+				m_bulletMap.emplace(key, Array<EnemyBullet>());
 		}
 
 		void clear()
 		{
-			mStopWatch.reset();
-			for (auto& bullets : mBulletMap)
-				bullets.second.clear();
-			mPrevEnemyPos = Vec2::Zero();
+			m_stopwatch.reset();
+			for (auto& [key, bullets] : m_bulletMap)
+				bullets.clear();
+			m_prevEnemyPos = Vec2::Zero();
 		}
 
-		void start() { mStopWatch.start(); }
-		void pause() { mStopWatch.pause(); }
+		void start() { m_stopwatch.start(); }
+		void pause() { m_stopwatch.pause(); }
 
 		void update(const Vec2& enemyPos)
 		{
-			if (mStopWatch.isPaused())
+			if (m_stopwatch.isPaused())
 				return;
 
 			updateEvents(enemyPos);
 			updateBullets(enemyPos);
 			eraseBullets();
 
-			if (mStopWatch.ms() >= mWholePeriod)
+			if (m_stopwatch.ms() >= WholePeriodMs)
 			{
-				mStopWatch.reset();
-				mStopWatch.start();
+				m_stopwatch.reset();
+				m_stopwatch.start();
 			}
 
-			mPrevEnemyPos = enemyPos;
+			m_prevEnemyPos = enemyPos;
 		}
 
 		void draw() const
 		{
-			for (const auto& b : mBulletMap.at(eSnow))
+			for (const auto& b : m_bulletMap.at(eSnow))
 				Circle{b.pos, b.size}.draw(Palette::White);
-			for (const auto& b : mBulletMap.at(eTail))
+			for (const auto& b : m_bulletMap.at(eTail))
 				Circle{b.pos, b.size}.draw(Palette::Hotpink);
-			for (const auto& b : mBulletMap.at(eSpin))
+			for (const auto& b : m_bulletMap.at(eSpin))
 				Circle{b.pos, b.size}.draw(Palette::White);
 		}
 
-		bool checkHit(const Vec2& pos, const double size)
+		[[nodiscard]] bool checkHit(const Vec2& pos, double size) const
 		{
-			for (const auto& enemyBullets : mBulletMap)
-				for (const auto& enemyBullet : enemyBullets.second)
-					if (enemyBullet.pos.distanceFrom(pos) <= enemyBullet.size + size)
+			for (const auto& [key, bullets] : m_bulletMap)
+			{
+				for (const auto& bullet : bullets)
+				{
+					if (bullet.pos.distanceFrom(pos) <= bullet.size + size)
 						return true;
+				}
+			}
 			return false;
 		}
 
 	private:
-		enum BulletKey
-		{
-			eSpin = 0,
-			eTail = 1,
-			eSnow = 2
-		};
+		enum BulletKey { eSpin, eTail, eSnow };
 
-		HashTable<int, Array<EnemyBullet>> mBulletMap;
-		Stopwatch mStopWatch;
-		int32 mWholePeriod;
-		Vec2 mPrevEnemyPos;
+		static constexpr int32 WholePeriodMs = 10000;
 
-		bool triggerMs(int32 triggerTimePoint)
+		HashTable<int, Array<EnemyBullet>> m_bulletMap;
+		Stopwatch m_stopwatch;
+		Vec2 m_prevEnemyPos = Vec2::Zero();
+
+		[[nodiscard]] bool triggerMs(int32 timePoint) const
 		{
-			return abs(mStopWatch.ms() - triggerTimePoint) <= Scene::DeltaTime() * 1000.0 / 1.7;
+			return std::abs(m_stopwatch.ms() - timePoint) <= Scene::DeltaTime() * 1000.0 / 1.7;
 		}
 
-		bool periodMs(int32 period)
+		[[nodiscard]] bool periodMs(int32 period) const
 		{
-			const int32 now = mStopWatch.ms();
+			const int32 now = m_stopwatch.ms();
 			const double deltams = Scene::DeltaTime() * 1000.0 / 1.5;
-			return abs(now % period - period) <= deltams || now % period <= deltams;
+			return std::abs(now % period - period) <= deltams || now % period <= deltams;
 		}
 
-		bool passedMs(int32 timePoint) { return mStopWatch.ms() >= timePoint; }
+		[[nodiscard]] bool passedMs(int32 timePoint) const
+		{
+			return m_stopwatch.ms() >= timePoint;
+		}
 
 		void updateEvents(const Vec2& enemyPos)
 		{
 			if (triggerMs(500))
 			{
-				constexpr int perNum = 3; // 5 -> 3
+				constexpr int perNum = 3;
 				for (int i = 0; i < perNum; ++i)
 				{
 					const double angle = 2 * Math::Pi / perNum * i;
-					mBulletMap[eSpin].emplace_back(EnemyBullet(enemyPos, 80.f * Vec2(cos(angle), sin(angle)), Vec2::Zero(), 10)); // 120.f -> 80.f
+					m_bulletMap[eSpin].emplace_back(enemyPos, 80.0 * Vec2{std::cos(angle), std::sin(angle)}, Vec2::Zero(), 10.0);
 				}
 			}
 
-			if (passedMs(700) && !passedMs(9000) && periodMs(350)) // 250 -> 350
+			if (passedMs(700) && !passedMs(9000) && periodMs(350))
 			{
-				constexpr double speed = 1.0; // 1.35 -> 1.0
-				for (const auto& spinBullet : mBulletMap[eSpin])
-				{
-					mBulletMap[eTail].emplace_back(EnemyBullet(spinBullet.pos, -speed * spinBullet.vel.rotated(-Math::Pi / 2), Vec2::Zero(), 7));
-				}
+				for (const auto& spinBullet : m_bulletMap[eSpin])
+					m_bulletMap[eTail].emplace_back(spinBullet.pos, -spinBullet.vel.rotated(-Math::HalfPi), Vec2::Zero(), 7.0);
 			}
 
-			if (periodMs(2000 + RandomInt32() % 300)) // 1500 + RandomInt32() % 200 -> 2000 + RandomInt32() % 300
+			if (periodMs(2000 + Random(300)))
 			{
-				constexpr int perNum = 2; // 3 -> 2
+				constexpr int perNum = 2;
 				for (int i = 0; i < perNum; ++i)
 				{
-					const double genPos = Random() * 500.0 - 250.0;
-					const double speed = Random() * 10.0 + 6.0; // Random() * 15.0 + 10.0 -> Random() * 10.0 + 6.0
-					mBulletMap[eSnow].emplace_back(EnemyBullet(Vec2(genPos, -genPos), Vec2::Zero(), Vec2(speed, 1.2 * speed), 5));
+					const double genPos = Random(-250.0, 250.0);
+					const double speed = Random(6.0, 16.0);
+					m_bulletMap[eSnow].emplace_back(Vec2{genPos, -genPos}, Vec2::Zero(), Vec2{speed, 1.2 * speed}, 5.0);
 				}
 			}
 
 			if (triggerMs(9000))
 			{
-				for (auto& spinBullet : mBulletMap[eSpin])
-					spinBullet.acc = 2.0 * spinBullet.vel; // 3.0 -> 2.0
+				for (auto& spinBullet : m_bulletMap[eSpin])
+					spinBullet.acc = 2.0 * spinBullet.vel;
 			}
 		}
 
 		void updateBullets(const Vec2& enemyPos)
 		{
-			const Vec2 enemyVelocity = enemyPos - mPrevEnemyPos;
+			const Vec2 enemyVelocity = enemyPos - m_prevEnemyPos;
 
-			for (auto& b : mBulletMap[eSpin])
+			for (auto& b : m_bulletMap[eSpin])
 			{
 				b.vel.rotate(Math::Pi / 150);
 				b.update();
 				b.pos += enemyVelocity;
 			}
-			for (auto& b : mBulletMap[eTail])
+
+			for (auto& b : m_bulletMap[eTail])
 			{
-				if (b.stopwatch.ms() < 3000)
-					b.vel.rotate(Math::Pi / 270);
-				else
-					b.vel.rotate(Math::Pi / 450);
+				const double rotationSpeed = (b.stopwatch.ms() < 3000) ? Math::Pi / 270 : Math::Pi / 450;
+				b.vel.rotate(rotationSpeed);
 				b.update();
 			}
-			for (auto& b : mBulletMap[eSnow])
+
+			for (auto& b : m_bulletMap[eSnow])
 			{
 				b.vel.rotate(-Math::Pi / 2200);
 				b.update();
@@ -319,40 +338,48 @@ namespace DanmakuCore
 
 		void eraseBullets()
 		{
-			mBulletMap.at(eSpin).remove_if([](const EnemyBullet& b)
+			m_bulletMap[eSpin].remove_if([](const EnemyBullet& b) { return isOutOfSceneArea(b.pos); });
+			m_bulletMap[eTail].remove_if([](const EnemyBullet& b) { return isOutOfSceneArea(b.pos); });
+			m_bulletMap[eSnow].remove_if([](const EnemyBullet& b)
 			{
-				return (isOutOfSceneArea(b.pos));
-			});
-			mBulletMap.at(eTail).remove_if([](const EnemyBullet& b)
-			{
-				return (isOutOfSceneArea(b.pos));
-			});
-			mBulletMap.at(eSnow).remove_if([](const EnemyBullet& b)
-			{
-				constexpr int margin = 20;
-				return b.pos.x > Scene::Width() + margin || b.pos.y > Scene::Height() + margin;
+				return b.pos.x > Scene::Width() + SceneMargin || b.pos.y > Scene::Height() + SceneMargin;
 			});
 		}
 	};
-} // namespace DanmakuCore
-
-// ============================================================================
-// 3. GameSystem: ゲームロジック
-//    プレイヤー制御や、音声コマンドの管理 (学習・判定) を担当します.
-// ============================================================================
+}
 
 namespace GameSystem
 {
-	using namespace AudioCore;
+	enum class GamePhase { Learning, Playing, GameOver };
 
 	struct Config
 	{
-		static constexpr double InputVolumeThreshold = 0.1; // 感度を上げるために閾値を低く設定(0.5 -> 0.1).
-		static constexpr int32 K_Nearest = 7; // k-NNの k の値.
+		static constexpr double InputVolumeThreshold = 0.1;
+		static constexpr int32 K_Nearest = 7;
 		static constexpr int32 StabilityFrames = 5;
-		static constexpr double PlayerSpeed = 250.0; // 150.0 -> 250.0
-		static constexpr double ShotSpeed = 500.0; // 800.0 -> 500.0
+		static constexpr int32 MinLearningSamples = 60;
+
+		static constexpr double PlayerSpeed = 250.0;
+		static constexpr double PlayerHitboxSize = 8.0;
+		static constexpr double PlayerDisplaySize = 15.0;
+		static constexpr double ShotSpeed = 500.0;
 		static constexpr double ShotCoolTime = 0.15;
+		static constexpr double VowelDisplayRadius = 30.0;
+		static constexpr Vec2 PlayerInitialPos{400.0, 500.0};
+
+		static constexpr Vec2 EnemyInitialPos{400.0, 150.0};
+		static constexpr double EnemyHitboxSize = 100.0;
+		static constexpr double EnemyDisplaySize = 240.0;
+		static constexpr double EnemyMovementCyclePeriod = 12.0;
+		static constexpr double EnemyStationaryDuration = 11.0;
+		static constexpr double EnemyMovementDuration = 1.0;
+		static constexpr double EnemyMoveRangeMin = 280.0;
+		static constexpr double EnemyMoveRangeMax = 520.0;
+
+		static constexpr int32 SlotBoxSize = 100;
+		static constexpr int32 SlotGap = 20;
+		static constexpr int32 ScorePerHit = 100;
+		static constexpr Size WindowSize{800, 600};
 	};
 
 	struct PlayerBullet
@@ -364,42 +391,22 @@ namespace GameSystem
 	class Player
 	{
 	public:
-		Player(const Vec2& initialPos): m_pos(initialPos)
+		Player(const Vec2& initialPos, const Font& smallFont)
+			: m_pos(initialPos)
+			, m_smallFont(smallFont)
 		{
 		}
 
 		void update(const String& command, double deltaTime)
 		{
-			if (command == U"い")
-				m_pos.x -= Config::PlayerSpeed * deltaTime;
-			else if (command == U"う")
-				m_pos.y -= Config::PlayerSpeed * deltaTime;
-			else if (command == U"え")
-				m_pos.x += Config::PlayerSpeed * deltaTime;
-			else if (command == U"お")
-				m_pos.y += Config::PlayerSpeed * deltaTime;
-			// command == U"雑音" の場合は何も起きない(停止)
-
-			m_pos = m_pos.clamp(Scene::Rect());
-
-			m_shotTimer += deltaTime;
-			if (command == U"あ" && m_shotTimer >= Config::ShotCoolTime)
-			{
-				m_bullets.emplace_back(PlayerBullet{m_pos, Vec2{0, -Config::ShotSpeed}});
-				m_shotTimer = 0.0;
-			}
-
-			for (auto& b : m_bullets)
-				b.pos += b.vel * deltaTime;
-			m_bullets.remove_if([](const PlayerBullet& b)
-			{
-				return b.pos.y < -50;
-			});
+			updateMovement(command, deltaTime);
+			updateShooting(command, deltaTime);
+			updateBullets(deltaTime);
 		}
 
 		void draw() const
 		{
-			Circle{m_pos, 15}.draw(ColorF{0.25, 0.25, 0.28});
+			Circle{m_pos, Config::PlayerDisplaySize}.draw(ColorF{0.25, 0.25, 0.28});
 
 			for (const auto& b : m_bullets)
 			{
@@ -408,134 +415,192 @@ namespace GameSystem
 			}
 		}
 
+		void drawVowelIndicators(const String& activeCommand) const
+		{
+			static const Array<std::pair<String, Vec2>> VowelDirections = {
+				{U"あ", Vec2::Zero()},
+				{U"い", Vec2::Left()},
+				{U"う", Vec2::Up()},
+				{U"え", Vec2::Right()},
+				{U"お", Vec2::Down()}
+			};
+
+			for (const auto& [vowel, direction] : VowelDirections)
+			{
+				const Vec2 pos = m_pos + Config::VowelDisplayRadius * direction;
+				const bool isActive = (activeCommand == vowel);
+				m_smallFont(vowel).drawAt(pos, isActive ? Palette::Yellow : Palette::White);
+			}
+		}
+
 		void reset(const Vec2& pos)
 		{
 			m_pos = pos;
 			m_bullets.clear();
+			m_shotTimer = 0.0;
 		}
 
-		const Vec2& getPos() const { return m_pos; }
-		const Array<PlayerBullet>& getBullets() const { return m_bullets; }
+		[[nodiscard]] const Vec2& getPos() const { return m_pos; }
+		[[nodiscard]] const Array<PlayerBullet>& getBullets() const { return m_bullets; }
 
-		void removeBullet(size_t index)
+		void removeBulletAt(size_t index)
 		{
 			if (index < m_bullets.size())
-				m_bullets.remove_if([&](const PlayerBullet& b)
-				{
-					return &b == &m_bullets[index];
-				});
+				m_bullets.remove_at(index);
 		}
 
 	private:
 		Vec2 m_pos;
 		Array<PlayerBullet> m_bullets;
 		double m_shotTimer = 0.0;
+		const Font& m_smallFont;
+
+		void updateMovement(const String& command, double deltaTime)
+		{
+			const double delta = Config::PlayerSpeed * deltaTime;
+
+			if (command == U"い")      m_pos.x -= delta;
+			else if (command == U"う") m_pos.y -= delta;
+			else if (command == U"え") m_pos.x += delta;
+			else if (command == U"お") m_pos.y += delta;
+
+			m_pos = m_pos.clamp(Scene::Rect());
+		}
+
+		void updateShooting(const String& command, double deltaTime)
+		{
+			m_shotTimer += deltaTime;
+
+			if (command == U"あ" && m_shotTimer >= Config::ShotCoolTime)
+			{
+				m_bullets.emplace_back(PlayerBullet{m_pos, Vec2{0, -Config::ShotSpeed}});
+				m_shotTimer = 0.0;
+			}
+		}
+
+		void updateBullets(double deltaTime)
+		{
+			for (auto& b : m_bullets)
+				b.pos += b.vel * deltaTime;
+
+			m_bullets.remove_if([](const PlayerBullet& b) { return b.pos.y < -50; });
+		}
 	};
 
-	// 学習データの1スロット.
+	class Enemy
+	{
+	public:
+		Enemy()
+			: m_pos(Config::EnemyInitialPos)
+			, m_texture(U"👾"_emoji)
+		{
+		}
+
+		void update(double deltaTime)
+		{
+			m_time += deltaTime;
+			updateMovement();
+		}
+
+		void draw() const
+		{
+			m_texture.resized(Config::EnemyDisplaySize).drawAt(m_pos);
+		}
+
+		void reset()
+		{
+			m_time = 0.0;
+			m_pos = Config::EnemyInitialPos;
+			m_targetX = Config::EnemyInitialPos.x;
+			m_moveStartX = Config::EnemyInitialPos.x;
+			m_lastCycleTime = -1.0;
+		}
+
+		[[nodiscard]] const Vec2& getPos() const { return m_pos; }
+
+		[[nodiscard]] bool checkHitWithBullet(const Vec2& bulletPos) const
+		{
+			return bulletPos.distanceFrom(m_pos) < Config::EnemyHitboxSize;
+		}
+
+	private:
+		Vec2 m_pos;
+		Texture m_texture;
+		double m_time = 0.0;
+		double m_targetX = Config::EnemyInitialPos.x;
+		double m_moveStartX = Config::EnemyInitialPos.x;
+		double m_lastCycleTime = -1.0;
+
+		void updateMovement()
+		{
+			const double timeInCycle = std::fmod(m_time, Config::EnemyMovementCyclePeriod);
+
+			if (timeInCycle < Config::EnemyStationaryDuration)
+			{
+				if (m_lastCycleTime >= Config::EnemyStationaryDuration || m_lastCycleTime < 0)
+				{
+					m_targetX = Random(Config::EnemyMoveRangeMin, Config::EnemyMoveRangeMax);
+					m_moveStartX = m_pos.x;
+				}
+			}
+			else
+			{
+				const double progress = (timeInCycle - Config::EnemyStationaryDuration) / Config::EnemyMovementDuration;
+				m_pos.x = Math::Lerp(m_moveStartX, m_targetX, progress);
+			}
+
+			m_lastCycleTime = timeInCycle;
+		}
+	};
+
 	struct LearningSlot
 	{
 		String label;
-		Array<MFCC> samples;
+		Array<AudioCore::MFCC> samples;
 		bool isRecorded = false;
 	};
 
-	// 音声コマンドの管理システム (k-NN).
+	/// @brief k-NN による音声コマンド認識システム
 	class VoiceCommandSystem
 	{
 	public:
 		VoiceCommandSystem()
+			: m_slots({
+				{U"雑音", {}, false},
+				{U"あ", {}, false},
+				{U"い", {}, false},
+				{U"う", {}, false},
+				{U"え", {}, false},
+				{U"お", {}, false}
+			})
 		{
-			// "雑音" スロットを一番左に配置.
-			m_slots = {
-				{U"雑音", {}, false}, {U"あ", {}, false}, {U"い", {}, false}, {U"う", {}, false}, {U"え", {}, false}, {U"お", {}, false}};
 		}
 
-		String detectCommand(const MFCC& inputMFCC, double inputRMS)
+		[[nodiscard]] String detectCommand(const AudioCore::MFCC& inputMFCC)
 		{
-			// 音量による足切りは極小値(無音に近い場合)のみに行う.
-			// 0.5 などの高い閾値で弾くと、雑音クラスが判定される前に「判定不能」になってしまうため.
-			// ただし MFCC が Unset の場合は判定しようがないので弾く.
 			if (inputMFCC.isUnset())
 			{
-				m_potentialVowel = U"";
-				m_stabilityCount = 0;
-				m_confirmedVowel = U"";
+				resetStability();
 				return m_confirmedVowel;
 			}
 
-			// k-NN アルゴリズム.
-			struct Neighbor
-			{
-				double distSq;
-				int32 slotIndex;
-			};
-			Array<Neighbor> neighbors;
-
-			for (int32 i : step(m_slots.size()))
-			{
-				for (const auto& sample : m_slots[i].samples)
-				{
-					double d = inputMFCC.distSq(sample);
-					neighbors.push_back({d, i});
-				}
-			}
-
-			String bestLabel = U"";
-
-			if (not neighbors.isEmpty())
-			{
-				size_t k = Min<size_t>(Config::K_Nearest, neighbors.size());
-				std::partial_sort(neighbors.begin(), neighbors.begin() + k, neighbors.end(),
-				                  [](const Neighbor& a, const Neighbor& b)
-				                  {
-					                  return a.distSq < b.distSq;
-				                  });
-
-				HashTable<int32, int32> votes;
-				for (size_t i : step(k))
-				{
-					votes[neighbors[i].slotIndex]++;
-				}
-
-				int32 bestSlotIndex = -1;
-				int32 maxVotes = -1;
-				for (auto [slotIndex, count] : votes)
-				{
-					if (count > maxVotes)
-					{
-						maxVotes = count;
-						bestSlotIndex = slotIndex;
-					}
-				}
-
-				if (bestSlotIndex != -1)
-				{
-					bestLabel = m_slots[bestSlotIndex].label;
-				}
-			}
-
-			// チャタリング対策.
-			updateStability(bestLabel);
-
+			updateStability(findNearestLabel(inputMFCC));
 			return m_confirmedVowel;
 		}
 
-		void accumulateForLearning(const MFCC& mfcc)
+		void accumulateForLearning(const AudioCore::MFCC& mfcc)
 		{
 			m_learningBuffer.push_back(mfcc);
 		}
 
-		void resetLearningBuffer()
-		{
-			m_learningBuffer.clear();
-		}
+		void resetLearningBuffer() { m_learningBuffer.clear(); }
 
 		bool commitLearning(int32 slotIndex)
 		{
-			if (slotIndex < 0 || slotIndex >= (int32) m_slots.size())
+			if (slotIndex < 0 || slotIndex >= static_cast<int32>(m_slots.size()))
 				return false;
-			if (m_learningBuffer.size() <= 60)
+
+			if (static_cast<int32>(m_learningBuffer.size()) <= Config::MinLearningSamples)
 				return false;
 
 			m_slots[slotIndex].samples = m_learningBuffer;
@@ -543,19 +608,18 @@ namespace GameSystem
 			return true;
 		}
 
-		int32 getLearningSampleCount() const { return static_cast<int32>(m_learningBuffer.size()); }
-		Array<LearningSlot>& getSlots() { return m_slots; }
-		const Array<LearningSlot>& getSlots() const { return m_slots; }
-
-		bool isAllRecorded() const
+		[[nodiscard]] int32 getLearningSampleCount() const
 		{
-			return std::all_of(m_slots.begin(), m_slots.end(), [](const auto& s)
-			{
-				return s.isRecorded;
-			});
+			return static_cast<int32>(m_learningBuffer.size());
 		}
 
-		String getPotentialVowel() const { return m_potentialVowel; }
+		[[nodiscard]] Array<LearningSlot>& getSlots() { return m_slots; }
+		[[nodiscard]] const Array<LearningSlot>& getSlots() const { return m_slots; }
+
+		[[nodiscard]] bool isAllRecorded() const
+		{
+			return std::ranges::all_of(m_slots, [](const auto& s) { return s.isRecorded; });
+		}
 
 		void resetDetectionState()
 		{
@@ -564,18 +628,80 @@ namespace GameSystem
 			m_stabilityCount = 0;
 		}
 
+		[[nodiscard]] int32 findFirstUnrecordedSlotIndex() const
+		{
+			for (int32 i = 0; i < static_cast<int32>(m_slots.size()); ++i)
+			{
+				if (!m_slots[i].isRecorded)
+					return i;
+			}
+			return -1;
+		}
+
 	private:
 		Array<LearningSlot> m_slots;
-		Array<MFCC> m_learningBuffer;
-
-		String m_potentialVowel = U"";
-		String m_confirmedVowel = U"";
+		Array<AudioCore::MFCC> m_learningBuffer;
+		String m_potentialVowel;
+		String m_confirmedVowel;
 		int32 m_stabilityCount = 0;
 
+		[[nodiscard]] String findNearestLabel(const AudioCore::MFCC& inputMFCC) const
+		{
+			struct Neighbor
+			{
+				double distSq;
+				int32 slotIndex;
+			};
+
+			Array<Neighbor> neighbors;
+			neighbors.reserve(m_slots.size() * Config::MinLearningSamples);
+
+			for (int32 i = 0; i < static_cast<int32>(m_slots.size()); ++i)
+			{
+				for (const auto& sample : m_slots[i].samples)
+					neighbors.push_back({inputMFCC.distSq(sample), i});
+			}
+
+			if (neighbors.isEmpty())
+				return U"";
+
+			const size_t k = Min<size_t>(Config::K_Nearest, neighbors.size());
+			std::partial_sort(neighbors.begin(), neighbors.begin() + k, neighbors.end(),
+				[](const Neighbor& a, const Neighbor& b) { return a.distSq < b.distSq; });
+
+			HashTable<int32, int32> votes;
+			for (size_t i = 0; i < k; ++i)
+				votes[neighbors[i].slotIndex]++;
+
+			int32 bestSlotIndex = -1;
+			int32 maxVotes = 0;
+
+			for (const auto& [slotIndex, count] : votes)
+			{
+				if (count > maxVotes)
+				{
+					maxVotes = count;
+					bestSlotIndex = slotIndex;
+				}
+			}
+
+			return (bestSlotIndex >= 0) ? m_slots[bestSlotIndex].label : U"";
+		}
+
+		void resetStability()
+		{
+			m_potentialVowel = U"";
+			m_confirmedVowel = U"";
+			m_stabilityCount = 0;
+		}
+
+		/// @brief チャタリング防止のため、同じ結果が連続したときのみ確定する
 		void updateStability(const String& currentBest)
 		{
-			if (currentBest != U"" && currentBest == m_potentialVowel)
-				m_stabilityCount++;
+			if (!currentBest.isEmpty() && currentBest == m_potentialVowel)
+			{
+				++m_stabilityCount;
+			}
 			else
 			{
 				m_potentialVowel = currentBest;
@@ -586,16 +712,10 @@ namespace GameSystem
 				m_confirmedVowel = m_potentialVowel;
 		}
 	};
-} // namespace GameSystem
-
-// ============================================================================
-// 4. UserInterface: 画面UI制御
-//    学習画面とゲーム画面の具体的な描画・入力フローを管理します.
-// ============================================================================
+}
 
 namespace UserInterface
 {
-	using namespace AudioCore;
 	using namespace GameSystem;
 	using namespace DanmakuCore;
 
@@ -603,149 +723,223 @@ namespace UserInterface
 	{
 	public:
 		AppUI()
-			: m_player(Vec2{400, 500}), m_font(40), m_smallFont(20), m_enemyPos(400, 150)
+			: m_font(40)
+			, m_smallFont(20)
+			, m_player(Config::PlayerInitialPos, m_smallFont)
 		{
 			m_bulletCurtain.start();
 		}
 
-		void update(const Microphone& mic, MFCCAnalyzer& analyzer)
+		void update(const Microphone& mic, AudioCore::MFCCAnalyzer& analyzer)
 		{
-			const MFCC mfcc = analyzer.analyze(mic);
+			const auto mfcc = analyzer.analyze(mic);
 			const double rms = mic.rootMeanSquare();
 
-			if (m_isGameMode)
-				updateGamePhase(mfcc, rms);
-			else if (m_isGameOver)
-				updateGameOverPhase();
-			else
+			switch (m_phase)
+			{
+			case GamePhase::Learning:
 				updateLearningPhase(mfcc, rms);
+				break;
+			case GamePhase::Playing:
+				updatePlayingPhase(mfcc);
+				break;
+			case GamePhase::GameOver:
+				updateGameOverPhase();
+				break;
+			}
 		}
 
 	private:
-		bool m_isGameMode = false;
-		bool m_isGameOver = false;
-		int32 m_selectedSlotIndex = 0;
-		bool m_isMousePressed = false;
-		bool m_wasMousePressed = false;
-
-		Player m_player;
-		VoiceCommandSystem m_voiceSystem;
 		Font m_font;
 		Font m_smallFont;
 
-		// 弾幕ゲーム関連.
-		BulletCurtain m_bulletCurtain;
-		Vec2 m_enemyPos;
-		Texture m_enemyTexture{U"👾"_emoji};
-		Effect m_effect;
+		GamePhase m_phase = GamePhase::Learning;
+		int32 m_selectedSlotIndex = 0;
+		bool m_wasMousePressed = false;
 		int32 m_score = 0;
-		double m_enemyTime = 0.0;
-		double m_enemyTargetX = 400.0;
-		double m_enemyMoveStartX = 400.0;
-		double m_enemyNextTargetX = 400.0;
-		double m_lastEnemyCycleTime = -1.0;
 
-		// 敵と弾幕を初期化する
-		void resetEnemyAndBullets()
+		Player m_player;
+		Enemy m_enemy;
+		VoiceCommandSystem m_voiceSystem;
+		BulletCurtain m_bulletCurtain;
+		Effect m_effect;
+
+		void resetGame()
 		{
-			m_enemyTime = 0.0;
-			m_enemyPos = Vec2(400.0, 150.0);
-			m_enemyTargetX = 400.0;
-			m_enemyMoveStartX = 400.0;
-			m_enemyNextTargetX = 400.0;
-			m_lastEnemyCycleTime = -1.0;
+			m_player.reset(Config::PlayerInitialPos);
+			m_enemy.reset();
 			m_bulletCurtain.clear();
 			m_bulletCurtain.start();
+			m_score = 0;
+			m_voiceSystem.resetDetectionState();
 		}
 
-		void updateLearningPhase(const MFCC& mfcc, double rms)
+		void transitionTo(GamePhase newPhase)
+		{
+			m_phase = newPhase;
+			if (newPhase == GamePhase::Playing)
+				resetGame();
+		}
+
+		void drawGameBackground() const
+		{
+			Scene::SetBackground(ColorF{0.1, 0.2, 0.7});
+
+			for (int32 i = 0; i < 12; ++i)
+			{
+				const double alpha = Periodic::Sine0_1(2s, Scene::Time() - (2.0 / 12 * i));
+				Rect{0, i * 50, Config::WindowSize.x, 50}.draw(ColorF{1.0, alpha * 0.2});
+			}
+		}
+
+		void updateLearningPhase(const AudioCore::MFCC& mfcc, double rms)
 		{
 			Scene::SetBackground(Palette::Darkgray);
+
+			drawLearningHeader();
+			drawLearningSlots(mfcc);
+			handleRecordingLogic(mfcc, rms);
+			drawLearningFooter();
+		}
+
+		void drawLearningHeader() const
+		{
 			m_font(U"学習モード: 音声を登録").drawAt(Scene::Width() / 2, 50, Palette::White);
+			m_smallFont(U"操作方法：選択したボックスをマウスで押しながら音声を話してください")
+				.drawAt(Scene::Width() / 2, 120, Palette::White);
+		}
 
-			auto& slots = m_voiceSystem.getSlots();
+		[[nodiscard]] std::pair<int32, int32> calcSlotLayoutOrigin(size_t slotCount) const
+		{
+			const int32 totalWidth = Config::SlotBoxSize * static_cast<int32>(slotCount)
+				+ Config::SlotGap * (static_cast<int32>(slotCount) - 1);
+			return {(Scene::Width() - totalWidth) / 2, 200};
+		}
 
-			// スロット数に合わせて動的にレイアウト計算.
-			const int32 slotCount = static_cast<int32>(slots.size());
-			const int32 boxSize = 100;
-			const int32 gap = 20;
-			// 全体の幅を計算してセンタリング.
-			const int32 startX = (Scene::Width() - (boxSize * slotCount + gap * (slotCount - 1))) / 2;
-			const int32 startY = 200;
+		[[nodiscard]] Rect calcSlotBox(int32 index, int32 startX, int32 startY) const
+		{
+			return Rect{
+				startX + index * (Config::SlotBoxSize + Config::SlotGap),
+				startY,
+				Config::SlotBoxSize,
+				Config::SlotBoxSize
+			};
+		}
 
-			// ナビゲーションボタン用のレイアウト
-			const Rect prevBtn = Rect{Arg::center(startX - 80, startY + 50), 60, 60};
-			const Rect nextBtn = Rect{Arg::center(Scene::Width() - startX + 80, startY + 50), 60, 60};
+		void drawLearningSlots(const AudioCore::MFCC& mfcc)
+		{
+			const auto& slots = m_voiceSystem.getSlots();
+			const auto [startX, startY] = calcSlotLayoutOrigin(slots.size());
 
-			// 前へボタン
-			prevBtn.rounded(10).draw(prevBtn.mouseOver() ? Palette::Lightblue : Palette::Steelblue);
-			m_smallFont(U"←").drawAt(prevBtn.center(), Palette::White);
-			if (prevBtn.leftClicked())
-				m_selectedSlotIndex = (m_selectedSlotIndex + (int32) slots.size() - 1) % slots.size();
+			drawNavigationButtons(startX, startY, slots.size());
 
-			// 次へボタン
-			nextBtn.rounded(10).draw(nextBtn.mouseOver() ? Palette::Lightblue : Palette::Steelblue);
-			m_smallFont(U"→").drawAt(nextBtn.center(), Palette::White);
-			if (nextBtn.leftClicked())
-				m_selectedSlotIndex = (m_selectedSlotIndex + 1) % slots.size();
+			const String detectedCommand = m_voiceSystem.detectCommand(mfcc);
 
-			// 音声判定を実行（学習用）
-			String detectedCommand = m_voiceSystem.detectCommand(mfcc, rms);
-
-			for (int32 i : step(slots.size()))
+			for (int32 i = 0; i < static_cast<int32>(slots.size()); ++i)
 			{
-				const Rect box{startX + i * (boxSize + gap), startY, boxSize, boxSize};
+				const Rect box = calcSlotBox(i, startX, startY);
 				const bool isSelected = (i == m_selectedSlotIndex);
-				const bool isNoiseSlot = (slots[i].label == U"雑音");
-				const bool isDetected = (detectedCommand == slots[i].label && !detectedCommand.isEmpty());
+				const bool isDetected = (detectedCommand == slots[i].label);
 
 				if (box.leftClicked())
 					m_selectedSlotIndex = i;
 
-				// 判定されたボタンは異なる見た目でハイライト
-				if (isDetected)
-				{
-					box.rounded(10).draw(ColorF{0.5, 0.8, 0.5});
-					box.rounded(10).drawFrame(4, Palette::Limegreen);
-				}
-				else
-				{
-					box.rounded(10).draw(isSelected ? ColorF{0.3, 0.3, 0.4} : ColorF{0.2});
-					if (isSelected)
-						box.rounded(10).drawFrame(4, Palette::Skyblue);
-				}
+				drawSlotBox(box, slots[i], isSelected, isDetected);
+				drawSlotProgress(box, isSelected);
+			}
+		}
 
-				m_font(slots[i].label).drawAt(box.center(), Palette::White);
-				if (slots[i].isRecorded)
-					m_smallFont(U"OK").drawAt(box.bottomCenter().movedBy(0, -20), Palette::Lightgreen);
+		void drawNavigationButtons(int32 startX, int32 startY, size_t slotCount)
+		{
+			const Rect prevBtn{Arg::center(startX - 80, startY + 50), 60, 60};
+			const Rect nextBtn{Arg::center(Scene::Width() - startX + 80, startY + 50), 60, 60};
 
-				// 録音中でデータがバッファにあれば表示し続ける.
-				if (isSelected && m_voiceSystem.getLearningSampleCount() > 0)
-				{
-					const double progress = Min(m_voiceSystem.getLearningSampleCount() / 60.0, 1.0);
-					Circle{box.center(), 40}.drawArc(0_deg, 360_deg * progress, 4, 0, Palette::Orange);
-				}
+			prevBtn.rounded(10).draw(prevBtn.mouseOver() ? Palette::Lightblue : Palette::Steelblue);
+			m_smallFont(U"←").drawAt(prevBtn.center(), Palette::White);
+			if (prevBtn.leftClicked())
+				m_selectedSlotIndex = (m_selectedSlotIndex + static_cast<int32>(slotCount) - 1) % slotCount;
+
+			nextBtn.rounded(10).draw(nextBtn.mouseOver() ? Palette::Lightblue : Palette::Steelblue);
+			m_smallFont(U"→").drawAt(nextBtn.center(), Palette::White);
+			if (nextBtn.leftClicked())
+				m_selectedSlotIndex = (m_selectedSlotIndex + 1) % slotCount;
+		}
+
+		void drawSlotBox(const Rect& box, const LearningSlot& slot, bool isSelected, bool isDetected) const
+		{
+			if (isDetected)
+			{
+				box.rounded(10).draw(ColorF{0.5, 0.8, 0.5});
+				box.rounded(10).drawFrame(4, Palette::Limegreen);
+			}
+			else
+			{
+				box.rounded(10).draw(isSelected ? ColorF{0.3, 0.3, 0.4} : ColorF{0.2});
+				if (isSelected)
+					box.rounded(10).drawFrame(4, Palette::Skyblue);
 			}
 
-			handleRecordingLogic(mfcc, rms);
+			m_font(slot.label).drawAt(box.center(), Palette::White);
 
-			// 操作方法の表示
-			m_smallFont(U"操作方法：選択したボックスをマウスで押しながら音声を話してください").drawAt(Scene::Width() / 2, 120, Palette::White);
+			if (slot.isRecorded)
+				m_smallFont(U"OK").drawAt(box.bottomCenter().movedBy(0, -20), Palette::Lightgreen);
+		}
 
+		void drawSlotProgress(const Rect& box, bool isSelected) const
+		{
+			if (isSelected && m_voiceSystem.getLearningSampleCount() > 0)
+			{
+				const double progress = Min(
+					m_voiceSystem.getLearningSampleCount() / static_cast<double>(Config::MinLearningSamples),
+					1.0
+				);
+				Circle{box.center(), 40}.drawArc(0_deg, 360_deg * progress, 4, 0, Palette::Orange);
+			}
+		}
+
+		void handleRecordingLogic(const AudioCore::MFCC& mfcc, double rms)
+		{
+			const auto& slots = m_voiceSystem.getSlots();
+			const auto [startX, startY] = calcSlotLayoutOrigin(slots.size());
+			const Rect selectedBox = calcSlotBox(m_selectedSlotIndex, startX, startY);
+			const bool isNoiseSlot = (slots[m_selectedSlotIndex].label == U"雑音");
+			const bool isMousePressed = MouseL.pressed();
+
+			if (isMousePressed && !m_wasMousePressed)
+				m_voiceSystem.resetLearningBuffer();
+
+			const bool shouldAccumulate = selectedBox.mouseOver()
+				&& isMousePressed
+				&& (isNoiseSlot || rms > AudioCore::VolumeToRMS(Config::InputVolumeThreshold))
+				&& !mfcc.isUnset();
+
+			if (shouldAccumulate)
+				m_voiceSystem.accumulateForLearning(mfcc);
+
+			if (!isMousePressed && m_wasMousePressed)
+			{
+				if (m_voiceSystem.commitLearning(m_selectedSlotIndex))
+				{
+					const int32 nextSlot = m_voiceSystem.findFirstUnrecordedSlotIndex();
+					if (nextSlot >= 0)
+						m_selectedSlotIndex = nextSlot;
+				}
+				m_voiceSystem.resetLearningBuffer();
+			}
+
+			m_wasMousePressed = isMousePressed;
+		}
+
+		void drawLearningFooter()
+		{
 			if (m_voiceSystem.isAllRecorded())
 			{
-				const Rect startBtn = Rect{Arg::center(Scene::Width() / 2, 450), 300, 60};
+				const Rect startBtn{Arg::center(Scene::Width() / 2, 450), 300, 60};
 				startBtn.rounded(10).draw(startBtn.mouseOver() ? Palette::Orange : Palette::Darkorange);
 				m_font(U"ゲーム開始").drawAt(startBtn.center(), Palette::White);
 
 				if (startBtn.leftClicked())
-				{
-					m_isGameMode = true;
-					m_isGameOver = false;
-					m_player.reset(Vec2{400, 500});
-					m_score = 0;
-					resetEnemyAndBullets();
-				}
+					transitionTo(GamePhase::Playing);
 			}
 			else
 			{
@@ -753,271 +947,140 @@ namespace UserInterface
 			}
 		}
 
-		void handleRecordingLogic(const MFCC& mfcc, double rms)
+		void updatePlayingPhase(const AudioCore::MFCC& mfcc)
 		{
-			auto& slots = m_voiceSystem.getSlots();
-			const int32 slotCount = static_cast<int32>(slots.size());
-			const int32 boxSize = 100;
-			const int32 gap = 20;
-			const int32 startX = (Scene::Width() - (boxSize * slotCount + gap * (slotCount - 1))) / 2;
-			const int32 startY = 200;
+			drawGameBackground();
 
-			const Rect selectedBox{startX + m_selectedSlotIndex * (boxSize + gap), startY, boxSize, boxSize};
-			bool isNoiseSlot = (slots[m_selectedSlotIndex].label == U"雑音");
+			const String command = m_voiceSystem.detectCommand(mfcc);
 
-			m_isMousePressed = MouseL.pressed();
+			m_enemy.update(Scene::DeltaTime());
+			m_bulletCurtain.update(m_enemy.getPos());
+			m_player.update(command, Scene::DeltaTime());
 
-			// マウスボタンが押された時点でバッファをリセット
-			if (m_isMousePressed && !m_wasMousePressed)
-			{
-				m_voiceSystem.resetLearningBuffer();
-			}
+			checkCollisions();
 
-			// 選択ボックス内でマウスが押されている間、音声を蓄積
-			if (selectedBox.mouseOver() && m_isMousePressed && (isNoiseSlot || rms > VolumeToRMS(Config::InputVolumeThreshold)) && !mfcc.isUnset())
-			{
-				m_voiceSystem.accumulateForLearning(mfcc);
-			}
+			m_enemy.draw();
+			m_bulletCurtain.draw();
+			m_player.draw();
+			m_player.drawVowelIndicators(command);
+			m_effect.update();
 
-			// マウスボタンが離された時に学習を確定
-			if (!m_isMousePressed && m_wasMousePressed)
-			{
-				bool success = m_voiceSystem.commitLearning(m_selectedSlotIndex);
-				if (success)
-				{
-					// 学習成功時に未学習スロットの中で一番左のものに移動
-					int32 leftmostUnrecorded = -1;
-					for (int32 k = 0; k < (int32) slots.size(); ++k)
-					{
-						if (!slots[k].isRecorded)
-						{
-							leftmostUnrecorded = k;
-							break;
-						}
-					}
-					if (leftmostUnrecorded != -1)
-					{
-						m_selectedSlotIndex = leftmostUnrecorded;
-					}
-				}
-				m_voiceSystem.resetLearningBuffer();
-			}
-
-			m_wasMousePressed = m_isMousePressed;
+			drawPlayingUI();
 		}
 
-		void updateGamePhase(const MFCC& mfcc, double rms)
+		void checkCollisions()
 		{
-			Scene::SetBackground(ColorF{0.1, 0.2, 0.7});
-			for (auto i : step(12))
+			if (m_bulletCurtain.checkHit(m_player.getPos(), Config::PlayerHitboxSize))
 			{
-				const double a = Periodic::Sine0_1(2s, Scene::Time() - (2.0 / 12 * i));
-				Rect{0, (i * 50), 800, 50}.draw(ColorF(1.0, a * 0.2));
+				addPlayerDeathEffect();
+				transitionTo(GamePhase::GameOver);
+				return;
 			}
 
-			String command = m_voiceSystem.detectCommand(mfcc, rms);
-			String potential = m_voiceSystem.getPotentialVowel();
-
-			// 敵の左右移動を更新（12秒ループ：11秒停止 + 1秒移動）
-			m_enemyTime += Scene::DeltaTime();
-			const double movementCyclePeriod = 12.0; // 12秒のループ
-			const double stationaryDuration = 11.0; // 11秒停止
-			const double movementDuration = 1.0; // 1秒移動
-
-			const double timeInCycle = std::fmod(m_enemyTime, movementCyclePeriod);
-
-			if (timeInCycle < stationaryDuration)
+			const auto& bullets = m_player.getBullets();
+			for (size_t i = 0; i < bullets.size();)
 			{
-				// 停止状態：敵は現在位置で待機
-				// サイクル開始時に次の移動先をランダムに決定
-				if (m_lastEnemyCycleTime >= stationaryDuration || m_lastEnemyCycleTime < 0)
+				if (m_enemy.checkHitWithBullet(bullets[i].pos))
 				{
-					// 前フレームで移動状態から停止状態に遷移した、または初回
-					m_enemyNextTargetX = 280.0 + Random() * 240.0; // 280〜520の範囲
-					m_enemyMoveStartX = m_enemyPos.x;
-					m_enemyTargetX = m_enemyNextTargetX;
+					m_score += Config::ScorePerHit;
+					addBulletHitEffect(bullets[i].pos);
+					m_player.removeBulletAt(i);
 				}
-				m_lastEnemyCycleTime = timeInCycle;
-			}
-			else
-			{
-				// 移動状態：開始位置から目標位置へ1秒かけて移動
-				const double moveProgress = (timeInCycle - stationaryDuration) / movementDuration;
-				m_enemyPos.x = m_enemyMoveStartX + (m_enemyTargetX - m_enemyMoveStartX) * moveProgress;
-				m_lastEnemyCycleTime = timeInCycle;
-			}
-
-			m_bulletCurtain.update(m_enemyPos);
-
-			if (m_isGameOver)
-			{
-				// ゲームオーバー中はプレイヤーの更新と衝突判定をスキップ
-				m_effect.update();
-			}
-			else
-			{
-				m_player.update(command, Scene::DeltaTime());
-
-				if (m_bulletCurtain.checkHit(m_player.getPos(), 8.0))
+				else
 				{
-					m_effect.add([pos = m_player.getPos()](double t)
-					{
-						const double t2 = (1.0 - t);
-						Circle{pos, 10 + t * 70}.drawFrame(20 * t2, AlphaF(t2 * 0.5));
-						return (t < 1.0);
-					});
-
-					m_isGameOver = true;
-					m_isGameMode = false;
-				}
-
-				for (size_t i = 0; i < m_player.getBullets().size();)
-				{
-					const auto& bullet = m_player.getBullets()[i];
-					if (bullet.pos.distanceFrom(m_enemyPos) < 100.0)
-					{
-						m_score += 100;
-						m_effect.add([pos = bullet.pos](double t)
-						{
-							Circle{pos, t * 30}.drawFrame(2, Palette::Orange);
-							return t < 0.5;
-						});
-						m_player.removeBullet(i);
-					}
-					else
-					{
-						++i;
-					}
+					++i;
 				}
 			}
+		}
 
-			m_enemyTexture.resized(240).drawAt(m_enemyPos);
-			m_bulletCurtain.draw();
-
-			// ゲームオーバー中は自機を表示しない
-			if (!m_isGameOver)
+		void addPlayerDeathEffect()
+		{
+			m_effect.add([pos = m_player.getPos()](double t)
 			{
-				m_player.draw();
+				const double fade = 1.0 - t;
+				Circle{pos, 10 + t * 70}.drawFrame(20 * fade, AlphaF(fade * 0.5));
+				return t < 1.0;
+			});
+		}
 
-				// プレイヤーの周りに「あいうえお」を表示
-				const Vec2 playerPos = m_player.getPos();
-				const double radius = 30.0;
+		void addBulletHitEffect(const Vec2& pos)
+		{
+			m_effect.add([pos](double t)
+			{
+				Circle{pos, t * 30}.drawFrame(2, Palette::Orange);
+				return t < 0.5;
+			});
+		}
 
-				// あ: 中央, い: 左, う: 上, え: 右, お: 下
-				Array<std::pair<String, Vec2>> vowelPositions = {
-					{U"あ", Vec2(0, 0)},
-					{U"い", Vec2(-1, 0)},
-					{U"う", Vec2(0, -1)},
-					{U"え", Vec2(1, 0)},
-					{U"お", Vec2(0, 1)}
-				};
-
-				for (const auto& [vowel, direction] : vowelPositions)
-				{
-					const Vec2 pos = playerPos + radius * direction;
-					const bool isActive = (command == vowel && !command.isEmpty());
-
-					m_smallFont(vowel).drawAt(pos, isActive ? Palette::Yellow : Palette::White);
-				}
-
-				if (SimpleGUI::Button(U"再学習", Vec2{20, 80}))
-				{
-					m_isGameMode = false;
-					m_isGameOver = false;
-					m_score = 0;
-				}
-			}
-
-			m_effect.update();
+		void drawPlayingUI()
+		{
 			m_font(U"Score: {}"_fmt(m_score)).draw(20, 20, Palette::White);
+
+			if (SimpleGUI::Button(U"再学習", Vec2{20, 80}))
+				transitionTo(GamePhase::Learning);
 		}
 
 		void updateGameOverPhase()
 		{
-			// ゲーム画面の背景と敵を描画
-			Scene::SetBackground(ColorF{0.1, 0.2, 0.7});
-			for (auto i : step(12))
-			{
-				const double a = Periodic::Sine0_1(2s, Scene::Time() - (2.0 / 12 * i));
-				Rect{0, (i * 50), 800, 50}.draw(ColorF(1.0, a * 0.2));
-			}
-
-			m_enemyTexture.resized(240).drawAt(m_enemyPos);
+			drawGameBackground();
+			m_enemy.draw();
 			m_bulletCurtain.draw();
 			m_effect.update();
 
+			Rect{0, 0, Config::WindowSize}.draw(ColorF{0, 0, 0, 0.5});
+
+			drawGameOverUI();
+		}
+
+		void drawGameOverUI()
+		{
 			m_font(U"Score: {}"_fmt(m_score)).draw(20, 20, Palette::White);
-
-			// 半透明のオーバーレイ
-			Rect{0, 0, 800, 600}.draw(ColorF{0, 0, 0, 0.5});
-
-			// タイトル
 			m_font(U"ゲームオーバー").drawAt(400, 100, Palette::White);
-
-			// スコア表示
 			m_font(U"Final Score").drawAt(400, 180, Palette::Yellow);
 			m_font(U"{}"_fmt(m_score)).drawAt(400, 260, Palette::White);
 
-			// ツイートボタン
-			const Rect tweetBtn = Rect{Arg::center(400, 380), 240, 60};
+			const Rect tweetBtn{Arg::center(400, 380), 240, 60};
 			tweetBtn.rounded(10).draw(tweetBtn.mouseOver() ? ColorF{0.1, 0.6, 1.0} : ColorF{0.0, 0.5, 0.9});
 			m_smallFont(U"Twitterで共有").drawAt(tweetBtn.center(), Palette::White);
 
 			if (tweetBtn.leftClicked())
 			{
-				String tweetText = U"VowelShooting で {} 点獲得しました！\n母音操作シューティングゲーム (MFCC を Siv3D に組み込むサンプル) #VowelShooting"_fmt(m_score);
+				const String tweetText = U"VowelShooting で {} 点獲得しました！\n母音操作シューティングゲーム (MFCC を Siv3D に組み込むサンプル) #VowelShooting"_fmt(m_score);
 				Twitter::OpenTweetWindow(tweetText);
 			}
 
-			// リスタートボタン
-			const Rect restartBtn = Rect{Arg::center(400, 470), 240, 60};
+			const Rect restartBtn{Arg::center(400, 470), 240, 60};
 			restartBtn.rounded(10).draw(restartBtn.mouseOver() ? ColorF{0.2, 0.7, 0.2} : ColorF{0.1, 0.5, 0.1});
 			m_smallFont(U"リスタート").drawAt(restartBtn.center(), Palette::White);
 
 			if (restartBtn.leftClicked())
-			{
-				m_isGameMode = true;
-				m_isGameOver = false;
-				m_player.reset(Vec2{400, 500});
-				m_score = 0;
-				m_enemyTime = 0.0;
-				m_voiceSystem.resetDetectionState();
-				resetEnemyAndBullets();
-			}
+				transitionTo(GamePhase::Playing);
 
-			// 再学習ボタン
 			if (SimpleGUI::Button(U"再学習", Vec2{20, 80}))
-			{
-				m_isGameMode = false;
-				m_isGameOver = false;
-				m_score = 0;
-			}
+				transitionTo(GamePhase::Learning);
 		}
 	};
-} // namespace UserInterface
-
-// ============================================================================
-// Main: エントリーポイント
-// ============================================================================
+}
 
 void Main()
 {
 	Window::SetTitle(U"Voice Controller Danmaku");
-	Window::Resize(800, 600);
+	Window::Resize(GameSystem::Config::WindowSize);
 
-	AudioCore::MFCCAnalyzer mfccAnalyzer{};
+	AudioCore::MFCCAnalyzer mfccAnalyzer;
 	Microphone mic{StartImmediately::Yes};
 	UserInterface::AppUI appUI;
 
 	while (System::Update())
 	{
-		if (System::EnumerateMicrophones().none([&](const auto& info)
+		const bool micDisconnected = System::EnumerateMicrophones().none([&](const auto& info)
 		{
 			return info.microphoneIndex == mic.microphoneIndex();
-		}))
-		{
+		});
+
+		if (micDisconnected)
 			mic.open(StartImmediately::Yes);
-		}
+
 		appUI.update(mic, mfccAnalyzer);
 	}
 }
