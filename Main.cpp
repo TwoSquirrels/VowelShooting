@@ -557,6 +557,13 @@ namespace GameSystem
 
 		String getPotentialVowel() const { return m_potentialVowel; }
 
+		void resetDetectionState()
+		{
+			m_potentialVowel = U"";
+			m_confirmedVowel = U"";
+			m_stabilityCount = 0;
+		}
+
 	private:
 		Array<LearningSlot> m_slots;
 		Array<MFCC> m_learningBuffer;
@@ -608,12 +615,15 @@ namespace UserInterface
 
 			if (m_isGameMode)
 				updateGamePhase(mfcc, rms);
+			else if (m_isGameOver)
+				updateGameOverPhase();
 			else
 				updateLearningPhase(mfcc, rms);
 		}
 
 	private:
 		bool m_isGameMode = false;
+		bool m_isGameOver = false;
 		int32 m_selectedSlotIndex = 0;
 		bool m_isMousePressed = false;
 		bool m_wasMousePressed = false;
@@ -731,6 +741,7 @@ namespace UserInterface
 				if (startBtn.leftClicked())
 				{
 					m_isGameMode = true;
+					m_isGameOver = false;
 					m_player.reset(Vec2{400, 500});
 					m_score = 0;
 					resetEnemyAndBullets();
@@ -837,72 +848,148 @@ namespace UserInterface
 			}
 
 			m_bulletCurtain.update(m_enemyPos);
-			m_player.update(command, Scene::DeltaTime());
 
-			if (m_bulletCurtain.checkHit(m_player.getPos(), 8.0))
+			if (m_isGameOver)
 			{
-				m_effect.add([pos = m_player.getPos()](double t)
-				{
-					const double t2 = (1.0 - t);
-					Circle{pos, 10 + t * 70}.drawFrame(20 * t2, AlphaF(t2 * 0.5));
-					return (t < 1.0);
-				});
-
-				m_player.reset(Vec2{400, 500});
-				m_score = 0;
-				resetEnemyAndBullets();
+				// ゲームオーバー中はプレイヤーの更新と衝突判定をスキップ
+				m_effect.update();
 			}
-
-			for (size_t i = 0; i < m_player.getBullets().size();)
+			else
 			{
-				const auto& bullet = m_player.getBullets()[i];
-				if (bullet.pos.distanceFrom(m_enemyPos) < 100.0)
+				m_player.update(command, Scene::DeltaTime());
+
+				if (m_bulletCurtain.checkHit(m_player.getPos(), 8.0))
 				{
-					m_score += 100;
-					m_effect.add([pos = bullet.pos](double t)
+					m_effect.add([pos = m_player.getPos()](double t)
 					{
-						Circle{pos, t * 30}.drawFrame(2, Palette::Orange);
-						return t < 0.5;
+						const double t2 = (1.0 - t);
+						Circle{pos, 10 + t * 70}.drawFrame(20 * t2, AlphaF(t2 * 0.5));
+						return (t < 1.0);
 					});
-					m_player.removeBullet(i);
+
+					m_isGameOver = true;
+					m_isGameMode = false;
 				}
-				else
+
+				for (size_t i = 0; i < m_player.getBullets().size();)
 				{
-					++i;
+					const auto& bullet = m_player.getBullets()[i];
+					if (bullet.pos.distanceFrom(m_enemyPos) < 100.0)
+					{
+						m_score += 100;
+						m_effect.add([pos = bullet.pos](double t)
+						{
+							Circle{pos, t * 30}.drawFrame(2, Palette::Orange);
+							return t < 0.5;
+						});
+						m_player.removeBullet(i);
+					}
+					else
+					{
+						++i;
+					}
 				}
 			}
 
 			m_enemyTexture.resized(240).drawAt(m_enemyPos);
 			m_bulletCurtain.draw();
-			m_player.draw();
-			m_effect.update();
 
-			// プレイヤーの周りに「あいうえお」を表示
-			const Vec2 playerPos = m_player.getPos();
-			const double radius = 30.0;
-
-			// あ: 中央, い: 左, う: 上, え: 右, お: 下
-			Array<std::pair<String, Vec2>> vowelPositions = {
-				{U"あ", Vec2(0, 0)},
-				{U"い", Vec2(-1, 0)},
-				{U"う", Vec2(0, -1)},
-				{U"え", Vec2(1, 0)},
-				{U"お", Vec2(0, 1)}
-			};
-
-			for (const auto& [vowel, direction] : vowelPositions)
+			// ゲームオーバー中は自機を表示しない
+			if (!m_isGameOver)
 			{
-				const Vec2 pos = playerPos + radius * direction;
-				const bool isActive = (command == vowel && !command.isEmpty());
+				m_player.draw();
 
-				m_smallFont(vowel).drawAt(pos, isActive ? Palette::Yellow : Palette::White);
+				// プレイヤーの周りに「あいうえお」を表示
+				const Vec2 playerPos = m_player.getPos();
+				const double radius = 30.0;
+
+				// あ: 中央, い: 左, う: 上, え: 右, お: 下
+				Array<std::pair<String, Vec2>> vowelPositions = {
+					{U"あ", Vec2(0, 0)},
+					{U"い", Vec2(-1, 0)},
+					{U"う", Vec2(0, -1)},
+					{U"え", Vec2(1, 0)},
+					{U"お", Vec2(0, 1)}
+				};
+
+				for (const auto& [vowel, direction] : vowelPositions)
+				{
+					const Vec2 pos = playerPos + radius * direction;
+					const bool isActive = (command == vowel && !command.isEmpty());
+
+					m_smallFont(vowel).drawAt(pos, isActive ? Palette::Yellow : Palette::White);
+				}
+
+				if (SimpleGUI::Button(U"再学習", Vec2{20, 80}))
+				{
+					m_isGameMode = false;
+					m_isGameOver = false;
+					m_score = 0;
+				}
 			}
+
+			m_effect.update();
+			m_font(U"Score: {}"_fmt(m_score)).draw(20, 20, Palette::White);
+		}
+
+		void updateGameOverPhase()
+		{
+			// ゲーム画面の背景と敵を描画
+			Scene::SetBackground(ColorF{0.1, 0.2, 0.7});
+			for (auto i : step(12))
+			{
+				const double a = Periodic::Sine0_1(2s, Scene::Time() - (2.0 / 12 * i));
+				Rect{0, (i * 50), 800, 50}.draw(ColorF(1.0, a * 0.2));
+			}
+
+			m_enemyTexture.resized(240).drawAt(m_enemyPos);
+			m_bulletCurtain.draw();
+			m_effect.update();
 
 			m_font(U"Score: {}"_fmt(m_score)).draw(20, 20, Palette::White);
 
+			// 半透明のオーバーレイ
+			Rect{0, 0, 800, 600}.draw(ColorF{0, 0, 0, 0.5});
+
+			// タイトル
+			m_font(U"ゲームオーバー").drawAt(400, 100, Palette::White);
+
+			// スコア表示
+			m_font(U"Final Score").drawAt(400, 180, Palette::Yellow);
+			m_font(U"{}"_fmt(m_score)).drawAt(400, 260, Palette::White);
+
+			// ツイートボタン
+			const Rect tweetBtn = Rect{Arg::center(400, 380), 240, 60};
+			tweetBtn.rounded(10).draw(tweetBtn.mouseOver() ? ColorF{0.1, 0.6, 1.0} : ColorF{0.0, 0.5, 0.9});
+			m_smallFont(U"Twitterで共有").drawAt(tweetBtn.center(), Palette::White);
+
+			if (tweetBtn.leftClicked())
+			{
+				String tweetText = U"VowelShooting で {} 点獲得しました！\n母音操作シューティングゲーム (MFCC を Siv3D に組み込むサンプル) #VowelShooting"_fmt(m_score);
+				Twitter::OpenTweetWindow(tweetText);
+			}
+
+			// リスタートボタン
+			const Rect restartBtn = Rect{Arg::center(400, 470), 240, 60};
+			restartBtn.rounded(10).draw(restartBtn.mouseOver() ? ColorF{0.2, 0.7, 0.2} : ColorF{0.1, 0.5, 0.1});
+			m_smallFont(U"リスタート").drawAt(restartBtn.center(), Palette::White);
+
+			if (restartBtn.leftClicked())
+			{
+				m_isGameMode = true;
+				m_isGameOver = false;
+				m_player.reset(Vec2{400, 500});
+				m_score = 0;
+				m_enemyTime = 0.0;
+				m_voiceSystem.resetDetectionState();
+				resetEnemyAndBullets();
+			}
+
+			// 再学習ボタン
 			if (SimpleGUI::Button(U"再学習", Vec2{20, 80}))
 			{
 				m_isGameMode = false;
+				m_isGameOver = false;
 				m_score = 0;
 			}
 		}
