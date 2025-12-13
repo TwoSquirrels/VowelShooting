@@ -175,6 +175,7 @@ namespace DanmakuCore
 			mBulletMap.emplace(eSpin, Array<EnemyBullet>());
 			mBulletMap.emplace(eTail, Array<EnemyBullet>());
 			mBulletMap.emplace(eSnow, Array<EnemyBullet>());
+			mPrevEnemyPos = Vec2::Zero();
 		}
 
 		void clear()
@@ -182,6 +183,7 @@ namespace DanmakuCore
 			mStopWatch.reset();
 			for (auto& bullets : mBulletMap)
 				bullets.second.clear();
+			mPrevEnemyPos = Vec2::Zero();
 		}
 
 		void start() { mStopWatch.start(); }
@@ -193,7 +195,7 @@ namespace DanmakuCore
 				return;
 
 			updateEvents(enemyPos);
-			updateBullets();
+			updateBullets(enemyPos);
 			eraseBullets();
 
 			if (mStopWatch.ms() >= mWholePeriod)
@@ -201,6 +203,8 @@ namespace DanmakuCore
 				mStopWatch.reset();
 				mStopWatch.start();
 			}
+
+			mPrevEnemyPos = enemyPos;
 		}
 
 		void draw() const
@@ -233,6 +237,7 @@ namespace DanmakuCore
 		HashTable<int, Array<EnemyBullet>> mBulletMap;
 		Stopwatch mStopWatch;
 		int32 mWholePeriod;
+		Vec2 mPrevEnemyPos;
 
 		bool triggerMs(int32 triggerTimePoint)
 		{
@@ -260,7 +265,7 @@ namespace DanmakuCore
 				}
 			}
 
-			if (passedMs(700) && !passedMs(9000) && periodMs(250)) // 150 -> 250
+			if (passedMs(700) && !passedMs(9000) && periodMs(350)) // 250 -> 350
 			{
 				constexpr double speed = 1.0; // 1.35 -> 1.0
 				for (const auto& spinBullet : mBulletMap[eSpin])
@@ -269,7 +274,7 @@ namespace DanmakuCore
 				}
 			}
 
-			if (periodMs(1500 + RandomInt32() % 200)) // 1000 + RandomInt32() % 150 -> 1500 + RandomInt32() % 200
+			if (periodMs(2000 + RandomInt32() % 300)) // 1500 + RandomInt32() % 200 -> 2000 + RandomInt32() % 300
 			{
 				constexpr int perNum = 2; // 3 -> 2
 				for (int i = 0; i < perNum; ++i)
@@ -287,12 +292,15 @@ namespace DanmakuCore
 			}
 		}
 
-		void updateBullets()
+		void updateBullets(const Vec2& enemyPos)
 		{
+			const Vec2 enemyVelocity = enemyPos - mPrevEnemyPos;
+
 			for (auto& b : mBulletMap[eSpin])
 			{
 				b.vel.rotate(Math::Pi / 150);
 				b.update();
+				b.pos += enemyVelocity;
 			}
 			for (auto& b : mBulletMap[eTail])
 			{
@@ -342,7 +350,7 @@ namespace GameSystem
 		static constexpr double InputVolumeThreshold = 0.1; // 感度を上げるために閾値を低く設定(0.5 -> 0.1).
 		static constexpr int32 K_Nearest = 7; // k-NNの k の値.
 		static constexpr int32 StabilityFrames = 5;
-		static constexpr double PlayerSpeed = 150.0; // 200.0 -> 150.0
+		static constexpr double PlayerSpeed = 250.0; // 150.0 -> 250.0
 		static constexpr double ShotSpeed = 500.0; // 800.0 -> 500.0
 		static constexpr double ShotCoolTime = 0.15;
 	};
@@ -621,6 +629,24 @@ namespace UserInterface
 		Texture m_enemyTexture{U"👾"_emoji};
 		Effect m_effect;
 		int32 m_score = 0;
+		double m_enemyTime = 0.0;
+		double m_enemyTargetX = 400.0;
+		double m_enemyMoveStartX = 400.0;
+		double m_enemyNextTargetX = 400.0;
+		double m_lastEnemyCycleTime = -1.0;
+
+		// 敵と弾幕を初期化する
+		void resetEnemyAndBullets()
+		{
+			m_enemyTime = 0.0;
+			m_enemyPos = Vec2(400.0, 150.0);
+			m_enemyTargetX = 400.0;
+			m_enemyMoveStartX = 400.0;
+			m_enemyNextTargetX = 400.0;
+			m_lastEnemyCycleTime = -1.0;
+			m_bulletCurtain.clear();
+			m_bulletCurtain.start();
+		}
 
 		void updateLearningPhase(const MFCC& mfcc, double rms)
 		{
@@ -705,10 +731,9 @@ namespace UserInterface
 				if (startBtn.leftClicked())
 				{
 					m_isGameMode = true;
-					m_bulletCurtain.clear();
-					m_bulletCurtain.start();
 					m_player.reset(Vec2{400, 500});
 					m_score = 0;
+					resetEnemyAndBullets();
 				}
 			}
 			else
@@ -782,10 +807,39 @@ namespace UserInterface
 			String command = m_voiceSystem.detectCommand(mfcc, rms);
 			String potential = m_voiceSystem.getPotentialVowel();
 
+			// 敵の左右移動を更新（12秒ループ：11秒停止 + 1秒移動）
+			m_enemyTime += Scene::DeltaTime();
+			const double movementCyclePeriod = 12.0; // 12秒のループ
+			const double stationaryDuration = 11.0; // 11秒停止
+			const double movementDuration = 1.0; // 1秒移動
+
+			const double timeInCycle = std::fmod(m_enemyTime, movementCyclePeriod);
+
+			if (timeInCycle < stationaryDuration)
+			{
+				// 停止状態：敵は現在位置で待機
+				// サイクル開始時に次の移動先をランダムに決定
+				if (m_lastEnemyCycleTime >= stationaryDuration || m_lastEnemyCycleTime < 0)
+				{
+					// 前フレームで移動状態から停止状態に遷移した、または初回
+					m_enemyNextTargetX = 280.0 + Random() * 240.0; // 280〜520の範囲
+					m_enemyMoveStartX = m_enemyPos.x;
+					m_enemyTargetX = m_enemyNextTargetX;
+				}
+				m_lastEnemyCycleTime = timeInCycle;
+			}
+			else
+			{
+				// 移動状態：開始位置から目標位置へ1秒かけて移動
+				const double moveProgress = (timeInCycle - stationaryDuration) / movementDuration;
+				m_enemyPos.x = m_enemyMoveStartX + (m_enemyTargetX - m_enemyMoveStartX) * moveProgress;
+				m_lastEnemyCycleTime = timeInCycle;
+			}
+
 			m_bulletCurtain.update(m_enemyPos);
 			m_player.update(command, Scene::DeltaTime());
 
-			if (m_bulletCurtain.checkHit(m_player.getPos(), 4.0))
+			if (m_bulletCurtain.checkHit(m_player.getPos(), 8.0))
 			{
 				m_effect.add([pos = m_player.getPos()](double t)
 				{
@@ -795,14 +849,14 @@ namespace UserInterface
 				});
 
 				m_player.reset(Vec2{400, 500});
-				m_bulletCurtain.clear();
-				m_bulletCurtain.start();
 				m_score = 0;
+				resetEnemyAndBullets();
 			}
 
-			for (const auto& bullet : m_player.getBullets())
+			for (size_t i = 0; i < m_player.getBullets().size();)
 			{
-				if (bullet.pos.distanceFrom(m_enemyPos) < 40.0)
+				const auto& bullet = m_player.getBullets()[i];
+				if (bullet.pos.distanceFrom(m_enemyPos) < 100.0)
 				{
 					m_score += 100;
 					m_effect.add([pos = bullet.pos](double t)
@@ -810,10 +864,15 @@ namespace UserInterface
 						Circle{pos, t * 30}.drawFrame(2, Palette::Orange);
 						return t < 0.5;
 					});
+					m_player.removeBullet(i);
+				}
+				else
+				{
+					++i;
 				}
 			}
 
-			m_enemyTexture.resized(60).drawAt(m_enemyPos);
+			m_enemyTexture.resized(240).drawAt(m_enemyPos);
 			m_bulletCurtain.draw();
 			m_player.draw();
 			m_effect.update();
@@ -840,7 +899,6 @@ namespace UserInterface
 			}
 
 			m_font(U"Score: {}"_fmt(m_score)).draw(20, 20, Palette::White);
-			m_smallFont(U"あ: ショット   いうえお: 移動").drawAt(Scene::Width() / 2, Scene::Height() - 30, Palette::White);
 
 			if (SimpleGUI::Button(U"再学習", Vec2{20, 80}))
 			{
